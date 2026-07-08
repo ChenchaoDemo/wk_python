@@ -58,6 +58,7 @@ class ChaoxingGUI(tk.Tk):
         self.courses: List[Dict[str, str]] = []
         self.phase = "idle"
         self._last_log_message = ""
+        self._last_final_state = ""
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -189,7 +190,7 @@ class ChaoxingGUI(tk.Tk):
         )
         self.start_button.pack(side=tk.LEFT)
 
-        self.stop_button = ttk.Button(action_frame, text="停止任务", command=self._stop_task, state=tk.DISABLED)
+        self.stop_button = ttk.Button(action_frame, text="暂停任务", command=self._stop_task, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(10, 0))
 
         self.progress_bar = ttk.Progressbar(action_frame, variable=self.progress_var, maximum=100)
@@ -219,8 +220,13 @@ class ChaoxingGUI(tk.Tk):
 
     def _start_login_and_fetch(self) -> None:
         if self.worker and self.worker.is_alive():
-            messagebox.showinfo("提示", "当前已有任务在运行，请等待或点击停止。")
+            messagebox.showinfo("提示", "当前已有任务在运行，请等待或点击暂停。")
             return
+
+        if self.engine is not None:
+            # 如果上一次任务是暂停状态，浏览器会被保留；开始新一轮登录前先释放旧浏览器。
+            self.engine.close()
+            self.engine = None
 
         username = self.username_var.get().strip()
         password = self.password_var.get()
@@ -328,8 +334,8 @@ class ChaoxingGUI(tk.Tk):
             except queue.Full:
                 pass
 
-        self.status_var.set("已请求停止任务，请等待当前步骤退出。")
-        self._append_log("已请求停止任务")
+        self.status_var.set("已请求暂停任务，请等待当前步骤停下来；浏览器窗口会保留。")
+        self._append_log("已请求暂停任务")
         self.stop_button.config(state=tk.DISABLED)
 
     def _poll_events(self) -> None:
@@ -432,6 +438,7 @@ class ChaoxingGUI(tk.Tk):
     def _apply_final_status(self, status: Dict[str, Any]) -> None:
         message = str(status.get("message") or "任务结束")
         final_state = str(status.get("status") or "")
+        self._last_final_state = final_state
         self._append_log(f"最终状态：{final_state}，{message}")
         self.status_var.set(f"最终状态：{final_state}，{message}")
         if final_state == "success":
@@ -446,7 +453,10 @@ class ChaoxingGUI(tk.Tk):
         messagebox.showerror("任务失败", first_line)
 
     def _handle_worker_done(self) -> None:
-        if self.phase in {"learning", "logging", "waiting_course"}:
+        if self.phase == "learning" and self._last_final_state == "stopped":
+            self._set_controls_for_phase("paused")
+            self.status_var.set("任务已暂停，浏览器窗口已保留。需要重新开始时可点击“登录并获取课程”。")
+        elif self.phase in {"learning", "logging", "waiting_course"}:
             self._set_controls_for_phase("idle")
 
     def _set_controls_for_phase(self, phase: str) -> None:
@@ -456,14 +466,15 @@ class ChaoxingGUI(tk.Tk):
         is_logging = phase == "logging"
         is_waiting = phase == "waiting_course"
         is_learning = phase == "learning"
+        is_paused = phase == "paused"
 
-        self.login_button.config(state=tk.NORMAL if is_idle else tk.DISABLED)
-        self.username_entry.config(state=tk.NORMAL if is_idle else tk.DISABLED)
-        self.password_entry.config(state=tk.NORMAL if is_idle else tk.DISABLED)
-        self.visible_check.config(state=tk.NORMAL if is_idle else tk.DISABLED)
-        self.manual_check.config(state=tk.NORMAL if is_idle else tk.DISABLED)
+        self.login_button.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
+        self.username_entry.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
+        self.password_entry.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
+        self.visible_check.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
+        self.manual_check.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
         self.start_button.config(state=tk.NORMAL if is_waiting and bool(self.courses) else tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL if (is_logging or is_waiting or is_learning) else tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL if (is_logging or is_learning) else tk.DISABLED)
 
     def _clear_courses(self) -> None:
         for item in self.course_tree.get_children():
@@ -484,6 +495,8 @@ class ChaoxingGUI(tk.Tk):
                 return
             self._stop_task()
         self._save_login(self.username_var.get().strip(), self.password_var.get())
+        if self.engine is not None:
+            self.engine.close()
         self.destroy()
 
 

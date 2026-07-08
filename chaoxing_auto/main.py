@@ -150,11 +150,14 @@ class ChaoxingAutomationEngine:
             return self.get_status()
 
     def stop_task(self) -> Dict[str, Any]:
-        """请求停止任务。"""
+        """请求暂停任务。
+
+        暂停只停止自动化循环，不主动关闭浏览器窗口，便于在当前页面继续观察或手动处理。
+        """
 
         self._stop_requested = True
-        self._notify_status(status="stopped", message="已请求停止任务")
-        logger.info("收到停止任务请求")
+        self._notify_status(status="stopped", message="已请求暂停任务，浏览器窗口会保留")
+        logger.info("收到暂停任务请求")
         return self.get_status()
 
     def get_status(self) -> Dict[str, Any]:
@@ -246,7 +249,7 @@ class ChaoxingAutomationEngine:
 
             self._learn_open_course(page)
             if self._stop_requested:
-                self._notify_status(status="stopped", message="任务已停止")
+                self._notify_status(status="stopped", message="任务已暂停，浏览器窗口已保留")
             else:
                 self._notify_status(status="success", progress=100.0, message="任务完成")
             return self.get_status()
@@ -257,7 +260,10 @@ class ChaoxingAutomationEngine:
             logger.exception("选中课程学习失败: %s", exc)
             return self.get_status()
         finally:
-            self.close()
+            if self._stop_requested:
+                logger.info("任务已暂停，保留浏览器窗口")
+            else:
+                self.close()
 
     def run(self) -> None:
         """完整自动化流程。
@@ -310,7 +316,7 @@ class ChaoxingAutomationEngine:
 
         for index, chapter in enumerate(chapters, start=1):
             if self._stop_requested:
-                logger.info("任务已停止，退出章节循环")
+                logger.info("任务已暂停，退出章节循环并保留浏览器")
                 break
 
             chapter_title = chapter.get("title", f"第 {index} 个章节")
@@ -342,7 +348,7 @@ class ChaoxingAutomationEngine:
 
                 played = video_player.play(on_progress=on_progress, should_stop=lambda: self._stop_requested)
                 if self._stop_requested or not played:
-                    self._notify_status(message=f"任务停止于章节: {chapter_title}")
+                    self._notify_status(message=f"任务暂停于章节: {chapter_title}")
                     break
                 self._notify_status(progress=round(index / total * 100, 2), message=f"章节完成: {chapter_title}")
                 logger.info("章节完成 [%s/%s]: %s", index, total, chapter_title)
