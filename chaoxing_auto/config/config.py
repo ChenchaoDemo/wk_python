@@ -13,8 +13,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 # =========================
 # 账号配置
 # =========================
-USERNAME: str = os.getenv("CHAOXING_USERNAME", "")
-PASSWORD: str = os.getenv("CHAOXING_PASSWORD", "")
+USERNAME: str = os.getenv("CHAOXING_USERNAME", "18369731161")
+PASSWORD: str = os.getenv("CHAOXING_PASSWORD", "wangqian12345@")
 
 # =========================
 # 学习通地址
@@ -24,7 +24,7 @@ LOGIN_URL: str = os.getenv("CHAOXING_LOGIN_URL", "https://passport2.chaoxing.com
 COURSE_LIST_URL: str = os.getenv("CHAOXING_COURSE_LIST_URL", "https://mooc1-1.chaoxing.com/visit/courses")
 
 # 默认课程名称，可通过命令行 --course 覆盖
-COURSE_NAME: str = os.getenv("CHAOXING_COURSE_NAME", "")
+COURSE_NAME: str = os.getenv("CHAOXING_COURSE_NAME", "马克思主义基本原理概论")
 
 # =========================
 # 浏览器配置
