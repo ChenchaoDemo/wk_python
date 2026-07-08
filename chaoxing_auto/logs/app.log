@@ -1,0 +1,20 @@
+2026-07-08 11:24:14 INFO 自动学习任务启动，课程名称: 
+2026-07-08 11:24:14 ERROR 任务执行失败: 课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course
+Traceback (most recent call last):
+  File "E:\github\wk_python\chaoxing_auto\main.py", line 64, in start_task
+    self.run()
+    ~~~~~~~~^^
+  File "E:\github\wk_python\chaoxing_auto\main.py", line 100, in run
+    raise ValueError("课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course")
+ValueError: 课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course
+2026-07-08 11:24:14 INFO 最终任务状态: {'course_name': '', 'chapter_name': '', 'progress': 0.0, 'status': 'failed', 'message': '课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course', 'course': '', 'chapter': ''}
+2026-07-08 11:24:17 INFO 自动学习任务启动，课程名称: 
+2026-07-08 11:24:17 ERROR 任务执行失败: 课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course
+Traceback (most recent call last):
+  File "E:\github\wk_python\chaoxing_auto\main.py", line 64, in start_task
+    self.run()
+    ~~~~~~~~^^
+  File "E:\github\wk_python\chaoxing_auto\main.py", line 100, in run
+    raise ValueError("课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course")
+ValueError: 课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course
+2026-07-08 11:24:17 INFO 最终任务状态: {'course_name': '', 'chapter_name': '', 'progress': 0.0, 'status': 'failed', 'message': '课程名称为空，请在 config/config.py 设置 COURSE_NAME，或运行时传入 --course', 'course': '', 'chapter': ''}
