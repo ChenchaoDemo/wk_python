@@ -23,7 +23,7 @@ class TaskStatus:
     course_name: str = ""
     chapter_name: str = ""
     progress: float = 0.0
-    status: str = "idle"  # idle/running/success/failed/stopped/skipped
+    status: str = "idle"  # idle/running/courses_loaded/success/failed/stopped/skipped
     message: str = ""
 
     def to_dict(self) -> Dict[str, Any]:

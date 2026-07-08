@@ -18,6 +18,7 @@
 - 异常自动截图到 `screenshots/error_xxx.png`
 - 支持 Playwright 页面调试暂停模式
 - 提供 `start_task()`、`stop_task()`、`get_status()` 预留接口
+- 提供 Tkinter 可视化界面：输入账号密码登录，获取课程列表，选择课程后再开始学习
 
 ## 2. 环境安装
 
@@ -60,17 +61,27 @@ playwright install chromium
 playwright install
 ```
 
-## 4. 配置账号
+## 4. 可视化界面运行方式
 
-打开 `config/config.py`，填写：
+推荐使用可视化界面启动：
 
-```python
-USERNAME = "你的账号"
-PASSWORD = "你的密码"
-COURSE_NAME = "人工智能导论"
+```bash
+python gui.py
 ```
 
-也可以使用环境变量：
+界面流程：
+
+1. 输入学习通账号和密码；
+2. 点击 **登录并获取课程**；
+3. 程序登录成功后会在页面中显示课程列表；
+4. 选中课程；
+5. 点击 **开始学习选中课程** 后才会进入章节学习。
+
+如果出现验证码、滑块或安全验证，保持 **显示浏览器窗口** 和 **遇到验证码/滑块时等待我手动完成** 勾选，然后在打开的浏览器窗口里手动处理，完成后程序会继续读取课程。
+
+## 5. 命令行配置账号
+
+命令行运行可以使用环境变量配置账号：
 
 ```powershell
 $env:CHAOXING_USERNAME="你的账号"
@@ -84,7 +95,7 @@ $env:CHAOXING_COURSE_NAME="人工智能导论"
 LOGIN_URL = "https://passport2.chaoxing.com/login"
 ```
 
-## 5. 运行方式
+## 6. 命令行运行方式
 
 有界面模式，便于调试：
 
@@ -106,11 +117,12 @@ python main.py --course "人工智能导论" --debug
 
 调试模式会调用 Playwright 的 `page.pause()`，可以查看当前页面、定位元素和手动操作。
 
-## 6. 项目结构说明
+## 7. 项目结构说明
 
 ```text
 chaoxing_auto/
 ├── main.py                 # 程序入口，包含自动学习主流程和预留任务接口
+├── gui.py                  # Tkinter 可视化界面
 ├── config/
 │   └── config.py           # 配置文件，账号、URL、浏览器、等待时间等
 ├── browser/
@@ -133,7 +145,7 @@ chaoxing_auto/
 └── README.md
 ```
 
-## 7. 任务状态接口
+## 8. 任务状态接口
 
 `main.py` 中提供 `ChaoxingAutomationEngine`：
 
@@ -168,15 +180,15 @@ engine.stop_task()
 }
 ```
 
-## 8. 常见问题
+## 9. 常见问题
 
-### 8.1 第一次登录后生成 auth.json
+### 9.1 第一次登录后生成 auth.json
 
 首次登录成功后会自动保存 `auth.json`。下次启动时 `BrowserManager` 会自动加载该文件，减少重复登录。
 
-### 8.2 出现验证码怎么办
+### 9.2 出现验证码怎么办
 
-程序会检测验证码、滑块、安全验证等页面，并保存截图。可使用：
+可视化界面会等待你在浏览器窗口中手动完成验证码、滑块或安全验证。命令行模式下程序会检测验证码、滑块、安全验证等页面，并保存截图；也可使用：
 
 ```bash
 python main.py --course "人工智能导论" --debug
@@ -184,7 +196,7 @@ python main.py --course "人工智能导论" --debug
 
 进入调试暂停后，在浏览器中手动处理页面，再继续后续流程。
 
-### 8.3 获取不到课程或章节
+### 9.3 获取不到课程或章节
 
 学习通页面结构可能调整，优先检查：
 
@@ -194,7 +206,7 @@ python main.py --course "人工智能导论" --debug
 - 页面是否出现 iframe 或动态加载
 - `course/course_manager.py` 和 `course/chapter.py` 中的 selector 是否需要补充
 
-## 9. 后续扩展方向
+## 10. 后续扩展方向
 
 - 接入 FastAPI，提供 HTTP 接口启动/停止任务
 - 将 `TaskStatus` 写入 Redis 或数据库
