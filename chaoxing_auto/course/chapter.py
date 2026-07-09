@@ -99,10 +99,13 @@ class ChapterManager:
                     };
                     const getStatusContainer = (node) => {
                         return node
-                            ? (node.closest('.posCatalog_select,.ncells,h4[id^="cur"],div[id^="cur"],li[id^="cur"],dd[id^="cur"],.chapter,.chapter_item,.chapterItem,.catalog,.catalogue,.units,.leveltwo,li,dd,dt') || node)
+                            ? (node.closest('h3.clearfix,h3,.posCatalog_select,.ncells,h4[id^="cur"],div[id^="cur"],li[id^="cur"],dd[id^="cur"],.chapter,.chapter_item,.chapterItem,.catalog,.catalogue,.units,.leveltwo,li,dd,dt') || node)
                             : null;
                     };
                     const getStatusInfo = (node) => {
+                        // 新页面规则：
+                        //   <em class="openlock"></em> => 当前章节已完成
+                        //   没有 openlock              => 未完成，后续进入卡片/视频判断
                         // 页面规则：
                         //   roundpointStudent blue                  => 已完成
                         //   roundpointStudent noJob                 => 未完成/无任务
@@ -110,6 +113,19 @@ class ChapterManager:
                         const container = node
                             ? getStatusContainer(node)
                             : null;
+                        const openlock = container ? container.querySelector('em.openlock,.openlock') : null;
+                        if (openlock) {
+                            const classText = clean(openlock.className || '');
+                            const statusText = clean(`${openlock.outerHTML || ''} ${classText}`);
+                            return {
+                                completed: true,
+                                source: 'page_openlock',
+                                statusClass: classText,
+                                statusDecision: 'em.openlock => 已完成，登记为已完成，不加入待刷列表',
+                                statusText,
+                            };
+                        }
+
                         const point = container ? container.querySelector('.roundpointStudent') : null;
                         if (point) {
                             const classText = clean(point.className || '');
@@ -163,7 +179,8 @@ class ChapterManager:
                         const statusInfo = getStatusInfo(node);
                         const actionText = `${rawUrl} ${rawOnclick} ${node ? (node.outerHTML || '') : ''}`;
                         const hasLearningAction = /getTeacherAjax|studentstudy|chapterId|knowledge|jobid|mooc2/i.test(actionText);
-                        const hasPageStatus = statusInfo.source === 'page_roundpoint'
+                        const hasPageStatus = statusInfo.source === 'page_openlock'
+                            || statusInfo.source === 'page_roundpoint'
                             || statusInfo.source === 'page_explicit_completed';
                         // 过滤“第1章/第2章”这类父级标题：它们没有 roundpointStudent，也没有真正的学习入口，
                         // 否则会被当成章节打开后出现“章节视频不存在”。
@@ -212,7 +229,11 @@ class ChapterManager:
                     });
 
                     nodes.forEach(node => {
-                        const text = node.getAttribute('title') || node.innerText || node.textContent || '';
+                        const text = node.getAttribute('title')
+                            || (node.querySelector && node.querySelector('.articlename[title]') ? node.querySelector('.articlename[title]').getAttribute('title') : '')
+                            || node.innerText
+                            || node.textContent
+                            || '';
                         const onclick = node.getAttribute('onclick') || node.getAttribute('href') || '';
                         let href = node.href || node.getAttribute('href') || node.getAttribute('data') || node.getAttribute('data-url') || '';
                         try { href = href ? new URL(href, location.href).href : ''; } catch (e) {}
@@ -463,6 +484,9 @@ class ChapterManager:
             return True
 
         status_text = str(item.get("status_text") or "")
+        if "openlock" in status_text:
+            return True
+
         if "roundpointStudent" in status_text:
             has_blue = "blue" in status_text
             has_incomplete = any(word in status_text for word in ("noJob", "orange01", "a002", "jobCount"))

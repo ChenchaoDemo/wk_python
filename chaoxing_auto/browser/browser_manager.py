@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError
 from playwright.sync_api import Page, Playwright, sync_playwright
@@ -39,6 +39,8 @@ class BrowserManager:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self._cdp_sessions: list[Any] = []
+        self._debugger_disabled_page_ids: set[int] = set()
 
     def start_browser(self) -> Browser:
         """启动浏览器。
@@ -109,11 +111,57 @@ class BrowserManager:
             self.context = self.browser.new_context(**context_kwargs)
             self.context.set_default_timeout(WAIT_TIME)
             self.context.set_default_navigation_timeout(WAIT_TIME)
+            self.context.on("page", self._disable_debugger_pause)
             self.context.add_init_script(
                 """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
+                (() => {
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined,
+                    });
+
+                    // 学习通部分测验页会通过 Function/eval/setInterval 注入 `debugger`，
+                    // 打开开发者工具时会反复暂停。这里尽量把动态字符串里的 debugger 去掉，
+                    // Playwright 自身读取 DOM/监听接口不再依赖手动 F12。
+                    const stripDebugger = (value) => {
+                        if (typeof value !== 'string') return value;
+                        return value.replace(/\\bdebugger\\s*;?/g, '');
+                    };
+
+                    try {
+                        const NativeFunction = window.Function;
+                        window.Function = new Proxy(NativeFunction, {
+                            apply(target, thisArg, args) {
+                                return Reflect.apply(target, thisArg, Array.from(args, stripDebugger));
+                            },
+                            construct(target, args) {
+                                return Reflect.construct(target, Array.from(args, stripDebugger), target);
+                            },
+                        });
+                    } catch (e) {}
+
+                    try {
+                        const nativeEval = window.eval;
+                        window.eval = new Proxy(nativeEval, {
+                            apply(target, thisArg, args) {
+                                return Reflect.apply(target, thisArg, Array.from(args, stripDebugger));
+                            },
+                        });
+                    } catch (e) {}
+
+                    ['setTimeout', 'setInterval'].forEach((name) => {
+                        try {
+                            const nativeTimer = window[name];
+                            window[name] = new Proxy(nativeTimer, {
+                                apply(target, thisArg, args) {
+                                    if (typeof args[0] === 'string') {
+                                        args = [stripDebugger(args[0]), ...Array.from(args).slice(1)];
+                                    }
+                                    return Reflect.apply(target, thisArg, args);
+                                },
+                            });
+                        } catch (e) {}
+                    });
+                })();
                 """
             )
             return self.context
@@ -132,11 +180,31 @@ class BrowserManager:
             self.page = self.context.new_page()
             self.page.set_default_timeout(WAIT_TIME)
             self.page.set_default_navigation_timeout(WAIT_TIME)
+            self._disable_debugger_pause(self.page)
             logger.info("已创建新页面")
             return self.page
         except Exception as exc:
             logger.exception("创建页面失败: %s", exc)
             raise
+
+    def _disable_debugger_pause(self, page: Page) -> None:
+        """通过 CDP 跳过 debugger 暂停，便于调试测验页结构。"""
+
+        if self.context is None:
+            return
+        page_id = id(page)
+        if page_id in self._debugger_disabled_page_ids:
+            return
+
+        try:
+            session = self.context.new_cdp_session(page)
+            session.send("Debugger.enable")
+            session.send("Debugger.setSkipAllPauses", {"skip": True})
+            self._cdp_sessions.append(session)
+            self._debugger_disabled_page_ids.add(page_id)
+            logger.info("已启用 debugger 跳过暂停")
+        except Exception as exc:  # noqa: BLE001 - 非 Chromium 或 CDP 不可用时不影响主流程
+            logger.debug("启用 debugger 跳过暂停失败，继续运行: %s", exc)
 
     def save_storage_state(self) -> None:
         """保存当前登录状态到 auth.json。"""
