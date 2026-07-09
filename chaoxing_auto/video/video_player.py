@@ -55,6 +55,7 @@ class VideoPlayer:
             while elapsed <= self.max_wait:
                 if should_stop is not None and should_stop():
                     logger.info("收到停止信号，停止等待视频完成")
+                    self._pause_video(frame)
                     return False
 
                 state = self._get_video_state(frame)
@@ -116,20 +117,46 @@ class VideoPlayer:
             logger.exception("视频播放异常: %s", exc)
             raise
 
-    def has_video(self) -> bool:
+    def has_video(self, timeout: Optional[int] = None) -> bool:
         """检测当前页面或 iframe 中是否存在 video 标签。"""
 
         try:
-            self._wait_for_video_frame()
+            self._wait_for_video_frame(max_wait=timeout)
             return True
         except VideoNotFoundError:
             return False
 
-    def _wait_for_video_frame(self) -> Frame:
+    def get_video_task_status(self, timeout: Optional[int] = None) -> Dict[str, str]:
+        """检测当前视频任务点状态。
+
+        学习通视频上方通常会显示“任务点已完成 / 任务点未完成”。
+        这里优先读取包含 video 的 frame；如果 frame 内没有状态，再读取主页面上的
+        任务点状态元素。只要明确看到“任务点已完成”，当前视频就可以跳过。
+        """
+
+        frame = self._wait_for_video_frame(max_wait=timeout)
+
+        frame_status = self._detect_task_status_in_frame(frame)
+        if frame_status.get("status") != "unknown":
+            return frame_status
+
+        page_status = self._detect_task_status_on_page()
+        if page_status.get("status") != "unknown":
+            return page_status
+
+        return {
+            "status": "unknown",
+            "completed": "false",
+            "source": "unknown",
+            "text": "",
+        }
+
+    def _wait_for_video_frame(self, max_wait: Optional[int] = None) -> Frame:
         """等待并返回包含 video 标签的 frame。"""
 
         elapsed = 0
-        while elapsed <= WAIT_TIME:
+        wait_limit = WAIT_TIME if max_wait is None else max_wait
+        while elapsed <= wait_limit:
             try:
                 return self._find_video_frame()
             except VideoNotFoundError:
@@ -148,6 +175,202 @@ class VideoPlayer:
             except Exception:
                 continue
         raise VideoNotFoundError("未找到 video 标签")
+
+    def _detect_task_status_in_frame(self, frame: Frame) -> Dict[str, str]:
+        """在指定 frame 内检测视频任务点状态。"""
+
+        try:
+            result = frame.evaluate(
+                """
+                () => {
+                    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || 1) > 0
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalizeStatus = (text, source) => {
+                        text = clean(text);
+                        if (!text) {
+                            return { status: 'unknown', completed: 'false', source, text: '' };
+                        }
+
+                        // 注意：完成条件说明里可能有“未完成任务点前, 当前视频不可拖拽”，
+                        // 这不是任务点状态，不能因为包含“未完成”二字就误判。
+                        // 所以这里优先看明确属性/类名/完整短语。
+                        const explicitCompleted = /aria-label=["']任务点已完成["']|title=["']任务点已完成["']|任务点已完成/i.test(text)
+                            || /(^|\\s)(ans-job-finished|job-finished|icon_Completed|jobFinish)(\\s|$)/i.test(text);
+                        if (explicitCompleted) {
+                            return { status: 'completed', completed: 'true', source, text };
+                        }
+
+                        const explicitUnfinished = /aria-label=["']任务点未完成["']|title=["']任务点未完成["']|任务点未完成|待完成/i.test(text)
+                            || /(^|\\s)(ans-job-unfinished|job-unfinished|orange01|jobCount|noJob)(\\s|$)/i.test(text);
+                        if (explicitUnfinished) {
+                            return { status: 'unfinished', completed: 'false', source, text };
+                        }
+                        return { status: 'unknown', completed: 'false', source, text };
+                    };
+                    const infoOf = (el) => clean([
+                        el.innerText || el.textContent || '',
+                        el.className || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.outerHTML || '',
+                    ].join(' '));
+
+                    const videos = Array.from(document.querySelectorAll('video'));
+                    const video = videos.find(v => Number.isFinite(v.duration) && v.duration > 0) || videos[0] || null;
+                    if (!video) {
+                        return { status: 'unknown', completed: 'false', source: 'frame_no_video', text: '' };
+                    }
+
+                    const containers = [];
+                    let node = video;
+                    for (let i = 0; node && i < 8; i += 1, node = node.parentElement) {
+                        containers.push(node);
+                    }
+
+                    for (const container of containers) {
+                        const selectors = [
+                            '.ans-job-finished',
+                            '.ans-job-unfinished',
+                            '.job-finished',
+                            '.job-unfinished',
+                            '.jobFinish',
+                            '.icon_Completed',
+                            '[title*="任务点"]',
+                            '[aria-label*="任务点"]',
+                            '[class*="job"]',
+                            '[class*="finish"]'
+                        ].join(',');
+                        const nodes = Array.from(container.querySelectorAll(selectors)).filter(isVisible);
+                        for (const item of nodes) {
+                            const status = normalizeStatus(infoOf(item), 'video_frame_near_video');
+                            if (status.status !== 'unknown') return status;
+                        }
+
+                        const directStatus = normalizeStatus(infoOf(container), 'video_frame_container');
+                        if (directStatus.status !== 'unknown') return directStatus;
+                    }
+
+                    const explicitNodes = Array.from(document.querySelectorAll([
+                        '.ans-job-finished',
+                        '.ans-job-unfinished',
+                        '.job-finished',
+                        '.job-unfinished',
+                        '.jobFinish',
+                        '.icon_Completed',
+                        '[title*="任务点"]',
+                        '[aria-label*="任务点"]'
+                    ].join(','))).filter(isVisible);
+                    for (const item of explicitNodes) {
+                        const status = normalizeStatus(infoOf(item), 'video_frame_explicit_node');
+                        if (status.status !== 'unknown') return status;
+                    }
+
+                    // 最后兜底：只看 frame 内是否明确出现“任务点已完成/任务点未完成”。
+                    const bodyText = clean(document.body ? document.body.innerText : '');
+                    if (/任务点已完成|任务点未完成/.test(bodyText)) {
+                        return normalizeStatus(bodyText, 'video_frame_body_text');
+                    }
+                    return { status: 'unknown', completed: 'false', source: 'video_frame_unknown', text: '' };
+                }
+                """
+            )
+            return result or {"status": "unknown", "completed": "false", "source": "frame_empty", "text": ""}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("检测 frame 内视频任务点状态失败: %s", exc)
+            return {"status": "unknown", "completed": "false", "source": "frame_error", "text": str(exc)}
+
+    def _detect_task_status_on_page(self) -> Dict[str, str]:
+        """在主页面检测当前视频任务点状态。"""
+
+        try:
+            result = self.page.evaluate(
+                """
+                () => {
+                    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && Number(style.opacity || 1) > 0
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const normalizeStatus = (text, source) => {
+                        text = clean(text);
+                        if (!text) {
+                            return { status: 'unknown', completed: 'false', source, text: '' };
+                        }
+
+                        // 注意：完成条件说明里可能有“未完成任务点前, 当前视频不可拖拽”，
+                        // 这不是任务点状态，不能因为包含“未完成”二字就误判。
+                        // 所以这里优先看明确属性/类名/完整短语。
+                        const explicitCompleted = /aria-label=["']任务点已完成["']|title=["']任务点已完成["']|任务点已完成/i.test(text)
+                            || /(^|\\s)(ans-job-finished|job-finished|icon_Completed|jobFinish)(\\s|$)/i.test(text);
+                        if (explicitCompleted) {
+                            return { status: 'completed', completed: 'true', source, text };
+                        }
+
+                        const explicitUnfinished = /aria-label=["']任务点未完成["']|title=["']任务点未完成["']|任务点未完成|待完成/i.test(text)
+                            || /(^|\\s)(ans-job-unfinished|job-unfinished|orange01|jobCount|noJob)(\\s|$)/i.test(text);
+                        if (explicitUnfinished) {
+                            return { status: 'unfinished', completed: 'false', source, text };
+                        }
+                        return { status: 'unknown', completed: 'false', source, text };
+                    };
+                    const infoOf = (el) => clean([
+                        el.innerText || el.textContent || '',
+                        el.className || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.outerHTML || '',
+                    ].join(' '));
+
+                    const selectors = [
+                        '.ans-job-finished',
+                        '.ans-job-unfinished',
+                        '.job-finished',
+                        '.job-unfinished',
+                        '.jobFinish',
+                        '.icon_Completed',
+                        '[title*="任务点"]',
+                        '[aria-label*="任务点"]'
+                    ].join(',');
+                    const nodes = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
+                    for (const node of nodes) {
+                        const status = normalizeStatus(infoOf(node), 'page_explicit_node');
+                        if (status.status !== 'unknown') return status;
+                    }
+
+                    const active = document.querySelector('.tabtags span.currents, .tabtags span.current, .tabtags span.active');
+                    if (active) {
+                        const container = active.closest('.tabtags, .ans-attach-ct, .ans-job, .chapter, .content, div') || active;
+                        const status = normalizeStatus(infoOf(container), 'page_active_card_container');
+                        if (status.status !== 'unknown') return status;
+                    }
+
+                    const bodyText = clean(document.body ? document.body.innerText : '');
+                    if (/任务点已完成|任务点未完成/.test(bodyText)) {
+                        return normalizeStatus(bodyText, 'page_body_text');
+                    }
+                    return { status: 'unknown', completed: 'false', source: 'page_unknown', text: '' };
+                }
+                """
+            )
+            return result or {"status": "unknown", "completed": "false", "source": "page_empty", "text": ""}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("检测主页面视频任务点状态失败: %s", exc)
+            return {"status": "unknown", "completed": "false", "source": "page_error", "text": str(exc)}
 
     def _start_video(self, frame: Frame) -> None:
         """通过 JS 启动 HTML5 video。"""
@@ -186,6 +409,23 @@ class VideoPlayer:
         )
         if not result or not result.get("ok"):
             raise RuntimeError(f"调用 video.play() 失败: {result}")
+
+    def _pause_video(self, frame: Frame) -> None:
+        """暂停当前 frame 中的 HTML5 video，供 GUI 暂停任务时使用。"""
+
+        try:
+            frame.evaluate(
+                """
+                () => {
+                    const videos = Array.from(document.querySelectorAll('video'));
+                    videos.forEach(video => {
+                        try { video.pause(); } catch (e) {}
+                    });
+                }
+                """
+            )
+        except Exception as exc:  # noqa: BLE001 - 暂停失败不影响停止自动化循环
+            logger.warning("暂停视频失败: %s", exc)
 
     def _get_video_state(self, frame: Frame) -> Dict[str, float]:
         """通过 JS 获取播放进度。"""

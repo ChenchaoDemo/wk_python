@@ -8,7 +8,16 @@ from typing import Optional
 from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError
 from playwright.sync_api import Page, Playwright, sync_playwright
 
-from config.config import AUTH_FILE, HEADLESS, SLOW_MO, WAIT_TIME, VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+from config.config import (
+    AUTH_FILE,
+    BROWSER_CHANNEL,
+    BROWSER_USER_AGENT,
+    HEADLESS,
+    SLOW_MO,
+    WAIT_TIME,
+    VIEWPORT_HEIGHT,
+    VIEWPORT_WIDTH,
+)
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -32,19 +41,36 @@ class BrowserManager:
         self.page: Optional[Page] = None
 
     def start_browser(self) -> Browser:
-        """启动 Chromium 浏览器。"""
+        """启动浏览器。
+
+        默认优先使用本机 Chrome，而不是 Playwright 自带 Chromium。
+        这样学习通返回的页面通常会和用户手动打开网页版时更一致。
+        """
 
         try:
-            logger.info("启动浏览器，headless=%s", self.headless)
+            logger.info("启动浏览器，headless=%s channel=%s", self.headless, BROWSER_CHANNEL or "playwright-chromium")
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.launch(
-                headless=self.headless,
-                slow_mo=self.slow_mo,
-                args=[
+            launch_kwargs = {
+                "headless": self.headless,
+                "slow_mo": self.slow_mo,
+                "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--start-maximized",
+                    "--disable-infobars",
+                    "--lang=zh-CN",
                 ],
-            )
+            }
+            if BROWSER_CHANNEL:
+                launch_kwargs["channel"] = BROWSER_CHANNEL
+
+            try:
+                self.browser = self.playwright.chromium.launch(**launch_kwargs)
+            except Exception as exc:
+                if not BROWSER_CHANNEL:
+                    raise
+                logger.warning("使用本机 Chrome 启动失败，回退到 Playwright Chromium: %s", exc)
+                launch_kwargs.pop("channel", None)
+                self.browser = self.playwright.chromium.launch(**launch_kwargs)
             return self.browser
         except Exception as exc:
             logger.exception("浏览器启动失败: %s", exc)
@@ -60,17 +86,18 @@ class BrowserManager:
         assert self.browser is not None
 
         context_kwargs = {
-            "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            # 有界面模式下不要固定成移动/小窗口视口，让页面更接近用户手动打开 Chrome 的效果。
+            "viewport": None if not self.headless else {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             "accept_downloads": True,
             "ignore_https_errors": True,
             "locale": "zh-CN",
             "timezone_id": "Asia/Shanghai",
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "extra_http_headers": {
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
         }
+        if BROWSER_USER_AGENT:
+            context_kwargs["user_agent"] = BROWSER_USER_AGENT
 
         if self.storage_state_path.exists():
             logger.info("加载登录状态: %s", self.storage_state_path)
@@ -82,6 +109,13 @@ class BrowserManager:
             self.context = self.browser.new_context(**context_kwargs)
             self.context.set_default_timeout(WAIT_TIME)
             self.context.set_default_navigation_timeout(WAIT_TIME)
+            self.context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+                """
+            )
             return self.context
         except Exception as exc:
             logger.exception("创建浏览器上下文失败: %s", exc)

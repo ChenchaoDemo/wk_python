@@ -73,6 +73,7 @@ class CourseManager:
                         const text = normalizeText(name);
                         if (!text) return true;
                         if (/^(移动到|添加课程|退课|已退课课程)$/.test(text)) return true;
+                        if (/结束/.test(text)) return true;
                         if (/登录|退出|首页|帮助|客服|通知|消息/.test(text)) return true;
                         return false;
                     };
@@ -388,7 +389,7 @@ class CourseManager:
             url = (course.get("url") or "").strip()
             if not name and not url:
                 continue
-            if name in {"移动到", "添加课程", "退课", "已退课课程"}:
+            if name in {"移动到", "添加课程", "退课", "已退课课程"} or "结束" in name:
                 continue
             key = (name, url)
 

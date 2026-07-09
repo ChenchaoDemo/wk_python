@@ -34,6 +34,10 @@ HEADLESS: bool = os.getenv("CHAOXING_HEADLESS", "false").lower() in {"1", "true"
 SLOW_MO: int = int(os.getenv("CHAOXING_SLOW_MO", "0"))
 VIEWPORT_WIDTH: int = int(os.getenv("CHAOXING_VIEWPORT_WIDTH", "1366"))
 VIEWPORT_HEIGHT: int = int(os.getenv("CHAOXING_VIEWPORT_HEIGHT", "900"))
+# 优先使用本机 Chrome，页面结构通常和手动网页版更一致；如果本机没有 Chrome 会自动回退到 Playwright Chromium。
+BROWSER_CHANNEL: str = os.getenv("CHAOXING_BROWSER_CHANNEL", "chrome").strip()
+# 默认不伪造 UA，直接使用真实浏览器 UA；如确实需要可通过环境变量覆盖。
+BROWSER_USER_AGENT: str = os.getenv("CHAOXING_BROWSER_USER_AGENT", "").strip()
 
 # =========================
 # 等待与轮询配置，单位：毫秒

@@ -36,16 +36,162 @@ class ChapterManager:
                 """
                 () => {
                     const result = [];
-                    const pushChapter = (title, url) => {
+                    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                    const currentUrl = new URL(location.href);
+                    const getParamFromUrl = (url, key) => {
+                        if (!url) return '';
+                        try {
+                            const parsed = new URL(url, location.href);
+                            return parsed.searchParams.get(key) || '';
+                        } catch (e) {
+                            const match = String(url).match(new RegExp(`${key}\\\\s*[=:]\\\\s*([0-9A-Za-z_-]+)`, 'i'));
+                            return match ? match[1] : '';
+                        }
+                    };
+                    const getCurrentParam = (key) => currentUrl.searchParams.get(key) || '';
+                    const extractIds = (rawUrl, onclick, node) => {
+                        const text = [rawUrl, onclick, node ? (node.outerHTML || '') : ''].join(' ');
+                        const ids = {
+                            course_id: getParamFromUrl(rawUrl, 'courseId') || getCurrentParam('courseId'),
+                            clazzid: getParamFromUrl(rawUrl, 'clazzid') || getCurrentParam('clazzid'),
+                            chapter_id: getParamFromUrl(rawUrl, 'chapterId'),
+                            cpi: getParamFromUrl(rawUrl, 'cpi') || getCurrentParam('cpi'),
+                        };
+
+                        const ajaxMatch = text.match(/getTeacherAjax\\s*\\(\\s*['"]?([0-9A-Za-z_-]+)['"]?\\s*,\\s*['"]?([0-9A-Za-z_-]+)['"]?\\s*,\\s*['"]?([0-9A-Za-z_-]+)['"]?/i);
+                        if (ajaxMatch) {
+                            ids.course_id = ids.course_id || ajaxMatch[1];
+                            ids.clazzid = ids.clazzid || ajaxMatch[2];
+                            ids.chapter_id = ids.chapter_id || ajaxMatch[3];
+                        }
+
+                        if (!ids.chapter_id && node) {
+                            const curNode = node.closest('[id^="cur"]');
+                            const idMatch = curNode && String(curNode.id || '').match(/^cur([0-9A-Za-z_-]+)$/i);
+                            if (idMatch) ids.chapter_id = idMatch[1];
+                        }
+
+                        if (!ids.chapter_id) {
+                            const match = text.match(/chapterId\\s*[=:]\\s*([0-9A-Za-z_-]+)/i);
+                            if (match) ids.chapter_id = match[1];
+                        }
+                        if (!ids.course_id) {
+                            const match = text.match(/courseId\\s*[=:]\\s*([0-9A-Za-z_-]+)/i);
+                            if (match) ids.course_id = match[1];
+                        }
+                        if (!ids.clazzid) {
+                            const match = text.match(/clazzid\\s*[=:]\\s*([0-9A-Za-z_-]+)/i);
+                            if (match) ids.clazzid = match[1];
+                        }
+                        if (!ids.cpi) {
+                            const match = text.match(/cpi\\s*[=:]\\s*([0-9A-Za-z_-]+)/i);
+                            if (match) ids.cpi = match[1];
+                        }
+                        return ids;
+                    };
+                    const getClassText = (node) => {
+                        if (!node) return '';
+                        return [
+                            node.className || '',
+                            node.getAttribute ? (node.getAttribute('title') || '') : '',
+                            node.getAttribute ? (node.getAttribute('aria-label') || '') : '',
+                        ].join(' ');
+                    };
+                    const getStatusContainer = (node) => {
+                        return node
+                            ? (node.closest('.posCatalog_select,.ncells,h4[id^="cur"],div[id^="cur"],li[id^="cur"],dd[id^="cur"],.chapter,.chapter_item,.chapterItem,.catalog,.catalogue,.units,.leveltwo,li,dd,dt') || node)
+                            : null;
+                    };
+                    const getStatusInfo = (node) => {
+                        // 页面规则：
+                        //   roundpointStudent blue                  => 已完成
+                        //   roundpointStudent noJob                 => 未完成/无任务
+                        //   roundpointStudent orange01 a002 jobCount => 未完成
+                        const container = node
+                            ? getStatusContainer(node)
+                            : null;
+                        const point = container ? container.querySelector('.roundpointStudent') : null;
+                        if (point) {
+                            const classText = clean(point.className || '');
+                            const statusText = clean(`${point.outerHTML || ''} ${classText} ${point.innerText || point.textContent || ''}`);
+                            const isIncomplete = /(^|\\s)(noJob|orange01|a002|jobCount)(\\s|$)/i.test(classText);
+                            const isCompleted = /(^|\\s)blue(\\s|$)/i.test(classText) && !isIncomplete;
+                            let statusDecision = 'roundpointStudent 其它状态 => 未完成，进入卡片/视频判断';
+                            if (isCompleted) {
+                                statusDecision = 'roundpointStudent blue => 已完成，直接跳过到下一节';
+                            } else if (/(^|\\s)noJob(\\s|$)/i.test(classText)) {
+                                statusDecision = 'roundpointStudent noJob => 未完成（没有工作），进入卡片/视频判断';
+                            } else if (/(^|\\s)(orange01|a002|jobCount)(\\s|$)/i.test(classText)) {
+                                statusDecision = 'roundpointStudent orange01/a002/jobCount => 未完成，进入卡片/视频判断';
+                            }
+                            return {
+                                completed: isCompleted,
+                                source: 'page_roundpoint',
+                                statusClass: classText,
+                                statusDecision,
+                                statusText,
+                            };
+                        }
+
+                        // 兼容少数旧页面的“已完成”图标；没有明确完成标记时一律未完成。
+                        const indicators = container
+                            ? Array.from(container.querySelectorAll('.icon_Completed,.ans-job-finished,.job-finished,.jobFinish,[title="已完成"],[aria-label="已完成"],[title*="任务点已完成"],[aria-label*="任务点已完成"]'))
+                            : [];
+                        const statusText = [
+                            indicators.map(indicator => `${indicator.innerText || indicator.textContent || ''} ${indicator.outerHTML || ''} ${getClassText(indicator)}`).join(' '),
+                            node ? getClassText(node) : '',
+                        ].join(' ');
+                        return {
+                            completed: indicators.length > 0,
+                            source: indicators.length > 0 ? 'page_explicit_completed' : 'page_no_completed_marker',
+                            statusClass: '',
+                            statusDecision: indicators.length > 0
+                                ? '旧页面明确已完成图标 => 已完成，直接跳过到下一节'
+                                : '未找到 roundpointStudent/明确完成图标 => 未完成，进入卡片/视频判断',
+                            statusText,
+                        };
+                    };
+                    const pushChapter = (title, url, node = null, extra = {}) => {
                         title = (title || '').replace(/\\s+/g, ' ').trim();
-                        url = (url || '').trim();
+                        const rawUrl = (url || '').trim();
+                        const rawOnclick = extra.onclick || (node && node.getAttribute ? clean(node.getAttribute('onclick') || '') : '');
+                        const ids = extractIds(rawUrl, rawOnclick, node);
+                        url = rawUrl;
                         if (/^(javascript:|#)/i.test(url)) url = '';
                         if (!title || title.length < 2) return;
                         if (/首页|讨论|通知|作业|考试|统计|资料|更多|返回|退出/.test(title)) return;
-                        result.push({ title, url });
+                        const statusInfo = getStatusInfo(node);
+                        const actionText = `${rawUrl} ${rawOnclick} ${node ? (node.outerHTML || '') : ''}`;
+                        const hasLearningAction = /getTeacherAjax|studentstudy|chapterId|knowledge|jobid|mooc2/i.test(actionText);
+                        const hasPageStatus = statusInfo.source === 'page_roundpoint'
+                            || statusInfo.source === 'page_explicit_completed';
+                        // 过滤“第1章/第2章”这类父级标题：它们没有 roundpointStudent，也没有真正的学习入口，
+                        // 否则会被当成章节打开后出现“章节视频不存在”。
+                        if (!hasLearningAction && !hasPageStatus) return;
+                        const container = node ? node.closest('.posCatalog_select,h4[id^="cur"],div[id^="cur"],li[id^="cur"],dd[id^="cur"]') : null;
+                        result.push({
+                            title,
+                            url,
+                            course_id: ids.course_id,
+                            clazzid: ids.clazzid,
+                            chapter_id: ids.chapter_id,
+                            cpi: ids.cpi,
+                            element_id: extra.element_id || (node ? clean(node.id || '') : ''),
+                            container_id: extra.container_id || (container ? clean(container.id || '') : ''),
+                            onclick: rawOnclick,
+                            completed: statusInfo.completed ? 'true' : 'false',
+                            status_source: statusInfo.source,
+                            status_class: clean(statusInfo.statusClass || ''),
+                            status_decision: clean(statusInfo.statusDecision || ''),
+                            status_text: clean(statusInfo.statusText),
+                        });
                     };
 
                     const selectors = [
+                        '.posCatalog_select .posCatalog_name',
+                        '.posCatalog_name[onclick]',
+                        'span[onclick*="getTeacherAjax"]',
+                        'a[href*="getTeacherAjax"]',
                         'a[href*="knowledge"]',
                         'a[href*="studentstudy"]',
                         'a[href*="mooc2"]',
@@ -66,34 +212,55 @@ class ChapterManager:
                     });
 
                     nodes.forEach(node => {
-                        const text = node.innerText || node.textContent || node.getAttribute('title') || '';
-                        let href = node.href || node.getAttribute('data') || node.getAttribute('data-url') || '';
+                        const text = node.getAttribute('title') || node.innerText || node.textContent || '';
+                        const onclick = node.getAttribute('onclick') || node.getAttribute('href') || '';
+                        let href = node.href || node.getAttribute('href') || node.getAttribute('data') || node.getAttribute('data-url') || '';
                         try { href = href ? new URL(href, location.href).href : ''; } catch (e) {}
                         const classText = `${node.className || ''} ${node.parentElement ? node.parentElement.className : ''}`;
-                        const looksLikeChapter = /章|节|课时|任务点|视频|[0-9]+\\.[0-9]+/.test(text)
+                        const looksLikeChapter = node.classList.contains('posCatalog_name')
+                            || /章|节|课时|任务点|视频|[0-9]+\\.[0-9]+/.test(text)
                             || /knowledge|studentstudy|chapter|jobid|mooc2/i.test(href)
+                            || /getTeacherAjax/i.test(onclick)
                             || /chapter|catalog|units|level/i.test(classText);
-                        if (looksLikeChapter) pushChapter(text, href);
+                        if (looksLikeChapter) {
+                            const container = node.closest('.posCatalog_select,h4[id^="cur"],div[id^="cur"],li[id^="cur"],dd[id^="cur"]');
+                            pushChapter(text, href, node, {
+                                container_id: container ? clean(container.id || '') : '',
+                                onclick,
+                            });
+                        }
                     });
 
                     // 章节标题不一定是链接，尝试寻找最近的可点击链接。
-                    document.querySelectorAll('.chapter,.chapter_item,.chapterItem,.catalog,.catalogue,.units,.leveltwo').forEach(item => {
+                    document.querySelectorAll('.chapter,.chapter_item,.chapterItem,.catalog,.catalogue,.units,.leveltwo,.ncells,h4[id^="cur"]').forEach(item => {
                         const text = item.innerText || item.textContent || '';
                         const link = item.querySelector('a[href]');
-                        let href = link ? link.href : '';
+                        const clickable = item.querySelector('[onclick*="getTeacherAjax"]') || link;
+                        let href = link ? (link.href || link.getAttribute('href') || '') : '';
+                        const onclick = clickable ? (clickable.getAttribute('onclick') || clickable.getAttribute('href') || '') : '';
                         try { href = href ? new URL(href, location.href).href : ''; } catch (e) {}
                         const firstLine = text.split('\\n').map(s => s.trim()).filter(Boolean)[0] || '';
-                        if (firstLine) pushChapter(firstLine, href);
+                        if (firstLine) pushChapter(firstLine, href, item, { onclick });
                     });
 
                     return result;
                 }
                 """
             )
-            cleaned = deduplicate_items(chapters, key_fields=("title", "url"))
+            cleaned = deduplicate_items(chapters, key_fields=("chapter_id", "title", "url"))
             logger.info("获取章节数量: %s", len(cleaned))
             for chapter in cleaned:
-                logger.info("章节: %s -> %s", chapter.get("title"), chapter.get("url"))
+                logger.info(
+                    "章节: %s chapterId=%s completed=%s source=%s class=%s decision=%s status=%s -> %s",
+                    chapter.get("title"),
+                    chapter.get("chapter_id") or "未显示",
+                    chapter.get("completed"),
+                    chapter.get("status_source") or "未显示",
+                    chapter.get("status_class") or "未显示",
+                    chapter.get("status_decision") or "未显示",
+                    chapter.get("status_text") or "未显示",
+                    chapter.get("url"),
+                )
             return cleaned
         except PlaywrightTimeoutError as exc:
             save_screenshot(self.page, "error_get_chapters_timeout")
@@ -119,9 +286,13 @@ class ChapterManager:
             if isinstance(chapter, str):
                 title = chapter
                 url = ""
+                element_id = ""
+                container_id = ""
             else:
                 title = chapter.get("title", "")
                 url = chapter.get("url", "")
+                element_id = chapter.get("element_id", "")
+                container_id = chapter.get("container_id", "")
 
             if not title and not url:
                 raise ChapterError("章节标题和链接均为空")
@@ -129,6 +300,13 @@ class ChapterManager:
             logger.info("打开章节: %s", title or url)
             if url:
                 self.page.goto(url, wait_until="domcontentloaded", timeout=WAIT_TIME)
+            elif element_id:
+                self.page.locator(f"#{element_id}").first.click(timeout=WAIT_TIME, force=True)
+            elif container_id:
+                self.page.locator(f"#{container_id} .posCatalog_name, #{container_id}").first.click(
+                    timeout=WAIT_TIME,
+                    force=True,
+                )
             else:
                 self.page.get_by_text(title, exact=False).first.click()
 
@@ -143,6 +321,221 @@ class ChapterManager:
             save_screenshot(self.page, "error_open_chapter")
             logger.exception("打开章节失败: %s", exc)
             raise
+
+    def get_cards(self) -> List[Dict[str, str]]:
+        """获取当前章节页里的卡片/页签列表。
+
+        学习通有些章节不是单一页面，而是在章节页内使用 `.tabtags` 卡片切换内容，
+        例如“目标及任务 / 学习内容 / 实训 / 测验 / 主题讨论”。这些卡片可能各自
+        包含视频或任务点，因此需要逐个点击处理。
+        """
+
+        try:
+            cards = self.page.evaluate(
+                """
+                () => {
+                    const result = [];
+                    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                    const detectCompleted = (text) => {
+                        text = clean(text);
+                        if (!text) return false;
+                        return /已完成|任务点已完成/.test(text)
+                            || /icon_Completed|ans-job-finished|job-finished|jobFinish/i.test(text);
+                    };
+                    const getStatusText = (node) => {
+                        const indicators = node
+                            ? Array.from(node.querySelectorAll('.icon_Completed,.ans-job-finished,.job-finished,.jobFinish,[title="已完成"],[aria-label="已完成"],[title*="任务点已完成"],[aria-label*="任务点已完成"]'))
+                            : [];
+                        return [
+                            node ? (node.innerText || node.textContent || '') : '',
+                            node ? (node.className || '') : '',
+                            node ? (node.getAttribute('title') || '') : '',
+                            node ? (node.getAttribute('aria-label') || '') : '',
+                            indicators.map(indicator => `${indicator.outerHTML || ''} ${indicator.className || ''}`).join(' '),
+                        ].join(' ');
+                    };
+                    const pushCard = (node, fallbackIndex) => {
+                        const title = clean(node.getAttribute('title') || node.innerText || node.textContent || `卡片 ${fallbackIndex}`);
+                        const cardid = clean(node.getAttribute('cardid') || node.getAttribute('data-cardid') || '');
+                        const id = clean(node.id || '');
+                        const onclick = clean(node.getAttribute('onclick') || '');
+                        const className = clean(node.className || '');
+                        const statusText = getStatusText(node);
+                        if (!title || /上一节|下一节/.test(title)) return;
+                        result.push({
+                            title,
+                            cardid,
+                            id,
+                            onclick,
+                            class_name: className,
+                            index: String(fallbackIndex),
+                            completed: detectCompleted(statusText) ? 'true' : 'false',
+                            status_text: clean(statusText),
+                        });
+                    };
+
+                    const nodes = [];
+                    document.querySelectorAll('.tabtags span[cardid], .tabtags span[id^="dct"], .tabtags span[onclick*="changeDisplayContent"]').forEach(node => {
+                        if (!nodes.includes(node)) nodes.push(node);
+                    });
+                    document.querySelectorAll('span[cardid][onclick*="changeDisplayContent"]').forEach(node => {
+                        if (!nodes.includes(node)) nodes.push(node);
+                    });
+
+                    nodes.forEach((node, index) => pushCard(node, index + 1));
+                    return result;
+                }
+                """
+            )
+            cleaned = deduplicate_items(cards, key_fields=("title", "cardid", "id"))
+            if cleaned:
+                logger.info("当前章节检测到卡片数量: %s", len(cleaned))
+                for card in cleaned:
+                    logger.info(
+                        "章节卡片: [%s] %s cardid=%s id=%s completed=%s",
+                        card.get("index"),
+                        card.get("title"),
+                        card.get("cardid"),
+                        card.get("id"),
+                        card.get("completed"),
+                    )
+            return cleaned
+        except Exception as exc:
+            logger.warning("获取章节卡片失败，按普通章节继续处理: %s", exc)
+            return []
+
+    def open_card(self, card: Dict[str, str]) -> Dict[str, str]:
+        """点击当前章节内的指定卡片。"""
+
+        title = (card.get("title") or "").strip()
+        cardid = (card.get("cardid") or "").strip()
+        element_id = (card.get("id") or "").strip()
+        index = (card.get("index") or "").strip()
+
+        try:
+            logger.info("打开章节卡片: %s", title or cardid or index)
+            clicked = False
+
+            if element_id:
+                locator = self.page.locator(f"#{element_id}").first
+                if locator.count() > 0:
+                    locator.click(timeout=WAIT_TIME, force=True)
+                    clicked = True
+
+            if not clicked and cardid:
+                locator = self.page.locator(f'.tabtags span[cardid="{cardid}"], span[cardid="{cardid}"]').first
+                if locator.count() > 0:
+                    locator.click(timeout=WAIT_TIME, force=True)
+                    clicked = True
+
+            if not clicked and title:
+                locator = self.page.locator(".tabtags span").filter(has_text=title).first
+                if locator.count() > 0:
+                    locator.click(timeout=WAIT_TIME, force=True)
+                    clicked = True
+
+            if not clicked:
+                raise ChapterError(f"未找到可点击的章节卡片: {title or cardid or index}")
+
+            # 卡片切换多数是页面内 JS 动态加载，不一定触发导航；这里给 DOM/iframe 一点刷新时间。
+            self.page.wait_for_timeout(1200)
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                logger.debug("章节卡片切换后等待 networkidle 超时，继续处理")
+
+            return {"title": title, "cardid": cardid, "id": element_id, "index": index}
+        except PlaywrightTimeoutError as exc:
+            save_screenshot(self.page, "error_open_card_timeout")
+            logger.exception("打开章节卡片超时: %s", exc)
+            raise ChapterError(f"打开章节卡片超时: {exc}") from exc
+        except Exception as exc:
+            save_screenshot(self.page, "error_open_card")
+            logger.exception("打开章节卡片失败: %s", exc)
+            raise
+
+    @staticmethod
+    def is_completed_item(item: Dict[str, str]) -> bool:
+        """判断章节/卡片条目是否已完成。"""
+
+        completed = str(item.get("completed") or "").strip().lower()
+        if completed in {"1", "true", "yes", "y"}:
+            return True
+
+        status_text = str(item.get("status_text") or "")
+        if "roundpointStudent" in status_text:
+            has_blue = "blue" in status_text
+            has_incomplete = any(word in status_text for word in ("noJob", "orange01", "a002", "jobCount"))
+            return has_blue and not has_incomplete
+
+        return any(word in status_text for word in ("已完成", "任务点已完成", "icon_Completed", "ans-job-finished"))
+
+    def is_current_content_completed(self) -> bool:
+        """检测当前打开的章节/卡片内容是否已完成。
+
+        该方法只做保守判断：优先看当前卡片、任务点图标、完成状态类名，不依赖整页普通文字，
+        避免因为页面其它位置存在“已完成”而误跳过。
+        """
+
+        try:
+            return bool(
+                self.page.evaluate(
+                    """
+                    () => {
+                        const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && Number(style.opacity || 1) > 0
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const detectCompleted = (text) => {
+                            text = clean(text);
+                            if (!text) return false;
+                            const hasIncomplete = /未完成|未学完|未开始|待完成|未提交|未观看|进行中/.test(text);
+                            const hasFullProgress = /100\\s*%|进度\\s*[:：]?\\s*100/.test(text);
+                            if (hasIncomplete && !hasFullProgress) return false;
+                            return /已完成|已学完|学习完成|任务点已完成|任务点完成|观看完成|播放完成|完成\\s*100|100\\s*%/.test(text)
+                                || /ans-job-finished|finished|finish|complete|completed|done|pass|passed|jobFinish|ywc/i.test(text);
+                        };
+                        const infoOf = (el) => [
+                            el.innerText || el.textContent || '',
+                            el.className || '',
+                            el.getAttribute('title') || '',
+                            el.getAttribute('aria-label') || '',
+                            el.outerHTML || '',
+                        ].join(' ');
+
+                        const activeCard = document.querySelector('.tabtags span.currents, .tabtags span.current, .tabtags span.active');
+                        if (activeCard && detectCompleted(infoOf(activeCard))) return true;
+
+                        const selectors = [
+                            '.ans-job-finished',
+                            '.job-finished',
+                            '.jobFinish',
+                            '[class*="finished"]',
+                            '[class*="complete"]',
+                            '[class*="done"]',
+                            '[class*="pass"]',
+                            '[title*="已完成"]',
+                            '[aria-label*="已完成"]',
+                            '[title*="任务点已完成"]',
+                            '[aria-label*="任务点已完成"]'
+                        ];
+                        const nodes = Array.from(document.querySelectorAll(selectors.join(',')))
+                            .filter(isVisible);
+                        return nodes.some(node => detectCompleted(infoOf(node)));
+                    }
+                    """
+                )
+            )
+        except Exception as exc:
+            logger.debug("检测当前内容完成状态失败，按未完成处理: %s", exc)
+            return False
 
     @staticmethod
     def find_chapter(chapters: List[Dict[str, str]], title: str) -> Optional[Dict[str, str]]:

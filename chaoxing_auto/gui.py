@@ -56,6 +56,7 @@ class ChaoxingGUI(tk.Tk):
         self.worker: Optional[threading.Thread] = None
         self.engine: Optional[ChaoxingAutomationEngine] = None
         self.courses: List[Dict[str, str]] = []
+        self.selected_course: Optional[Dict[str, str]] = None
         self.phase = "idle"
         self._last_log_message = ""
         self._last_final_state = ""
@@ -116,7 +117,7 @@ class ChaoxingGUI(tk.Tk):
         self.username_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 14), pady=5)
 
         ttk.Label(account_frame, text="密码：").grid(row=0, column=2, sticky=tk.W, padx=(0, 6), pady=5)
-        self.password_entry = ttk.Entry(account_frame, textvariable=self.password_var, show="*")
+        self.password_entry = ttk.Entry(account_frame, textvariable=self.password_var)
         self.password_entry.grid(row=0, column=3, sticky=tk.EW, padx=(0, 14), pady=5)
 
         self.login_button = ttk.Button(account_frame, text="登录并获取课程", command=self._start_login_and_fetch)
@@ -240,6 +241,8 @@ class ChaoxingGUI(tk.Tk):
             return
 
         self._save_login(username, password)
+        self.selected_course = None
+        self._last_final_state = ""
         self._clear_courses()
         self._set_controls_for_phase("logging")
         self.progress_var.set(0.0)
@@ -286,6 +289,9 @@ class ChaoxingGUI(tk.Tk):
             self.events.put(("phase", "learning"))
             final_status = self.engine.start_selected_course(selected_course)
             self.events.put(("final", final_status))
+            if final_status.get("status") == "success":
+                self.events.put(("courses", self.engine.courses))
+                self.events.put(("phase", "waiting_course"))
         except Exception as exc:  # noqa: BLE001 - 需要把异常完整反馈到界面
             self.events.put(("error", f"{exc}\n{traceback.format_exc()}"))
         finally:
@@ -295,6 +301,10 @@ class ChaoxingGUI(tk.Tk):
         self.events.put(("status", status))
 
     def _submit_selected_course(self) -> None:
+        if self.phase == "paused":
+            self._resume_paused_task()
+            return
+
         if self.phase != "waiting_course":
             return
         if self.course_selection_queue is None:
@@ -315,14 +325,78 @@ class ChaoxingGUI(tk.Tk):
             return
 
         try:
-            self.course_selection_queue.put_nowait(selected_course)
+            if self.course_selection_queue is not None and self.worker is not None and self.worker.is_alive():
+                self.course_selection_queue.put_nowait(selected_course)
+            else:
+                self.course_selection_queue = None
+                self.worker = threading.Thread(
+                    target=self._selected_course_worker,
+                    args=(selected_course,),
+                    daemon=True,
+                )
+                self.worker.start()
         except queue.Full:
             messagebox.showinfo("提示", "课程已经提交，请等待任务开始。")
             return
 
+        self.selected_course = selected_course
+        self._last_final_state = ""
         self._set_controls_for_phase("learning")
         self.status_var.set(f"已选择课程：{selected_course.get('name', '')}，正在开始学习...")
         self._append_log(f"已选择课程：{selected_course.get('name', '')}")
+
+    def _selected_course_worker(self, selected_course: Dict[str, str]) -> None:
+        """在已经登录并保留浏览器的情况下，直接学习用户新选择的课程。"""
+
+        try:
+            if self.engine is None:
+                self.events.put(("final", {"status": "failed", "message": "浏览器会话不存在，请重新登录"}))
+                return
+
+            self.events.put(("phase", "learning"))
+            final_status = self.engine.start_selected_course(selected_course)
+            self.events.put(("final", final_status))
+            if final_status.get("status") == "success":
+                self.events.put(("courses", self.engine.courses))
+                self.events.put(("phase", "waiting_course"))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", f"{exc}\n{traceback.format_exc()}"))
+        finally:
+            self.events.put(("done", None))
+
+    def _resume_paused_task(self) -> None:
+        """继续暂停的课程任务。"""
+
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("提示", "当前已有任务在运行，请等待或点击暂停。")
+            return
+        if self.engine is None:
+            messagebox.showwarning("无法继续", "没有可继续的任务，请重新登录并选择课程。")
+            self._set_controls_for_phase("idle")
+            return
+
+        self._last_final_state = ""
+        self._set_controls_for_phase("learning")
+        self.status_var.set("正在继续暂停的任务...")
+        self._append_log("继续暂停的任务")
+        self.worker = threading.Thread(target=self._resume_worker, daemon=True)
+        self.worker.start()
+
+    def _resume_worker(self) -> None:
+        try:
+            if self.engine is None:
+                self.events.put(("final", {"status": "failed", "message": "没有可继续的任务"}))
+                return
+            self.events.put(("phase", "learning"))
+            final_status = self.engine.resume_task()
+            self.events.put(("final", final_status))
+            if final_status.get("status") == "success":
+                self.events.put(("courses", self.engine.courses))
+                self.events.put(("phase", "waiting_course"))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("error", f"{exc}\n{traceback.format_exc()}"))
+        finally:
+            self.events.put(("done", None))
 
     def _stop_task(self) -> None:
         if self.engine is not None:
@@ -455,7 +529,10 @@ class ChaoxingGUI(tk.Tk):
     def _handle_worker_done(self) -> None:
         if self.phase == "learning" and self._last_final_state == "stopped":
             self._set_controls_for_phase("paused")
-            self.status_var.set("任务已暂停，浏览器窗口已保留。需要重新开始时可点击“登录并获取课程”。")
+            self.status_var.set("任务已暂停，浏览器窗口已保留。点击“继续任务”可从暂停章节继续。")
+        elif self.phase == "waiting_course" and self._last_final_state == "success":
+            self._set_controls_for_phase("waiting_course")
+            self.status_var.set("任务完成，浏览器已返回课程列表。请选择其他课程继续学习。")
         elif self.phase in {"learning", "logging", "waiting_course"}:
             self._set_controls_for_phase("idle")
 
@@ -468,12 +545,13 @@ class ChaoxingGUI(tk.Tk):
         is_learning = phase == "learning"
         is_paused = phase == "paused"
 
+        self.start_button.config(text="继续任务" if is_paused else "开始学习选中课程")
         self.login_button.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
         self.username_entry.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
         self.password_entry.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
         self.visible_check.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
         self.manual_check.config(state=tk.NORMAL if (is_idle or is_paused) else tk.DISABLED)
-        self.start_button.config(state=tk.NORMAL if is_waiting and bool(self.courses) else tk.DISABLED)
+        self.start_button.config(state=tk.NORMAL if ((is_waiting and bool(self.courses)) or is_paused) else tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL if (is_logging or is_learning) else tk.DISABLED)
 
     def _clear_courses(self) -> None:

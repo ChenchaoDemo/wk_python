@@ -54,6 +54,9 @@ class ChaoxingAutomationEngine:
         self.browser_manager: Optional[BrowserManager] = None
         self._stop_requested = False
         self.courses: List[Dict[str, str]] = []
+        self.current_course: Optional[Dict[str, str]] = None
+        self._resume_chapter_index = 0
+        self._resume_card_index = 0
 
     def set_status_callback(self, callback: Optional[Callable[[Dict[str, Any]], None]]) -> None:
         """设置状态回调，GUI 可通过该回调实时刷新界面。"""
@@ -122,6 +125,33 @@ class ChaoxingAutomationEngine:
         if self.browser_manager is not None:
             self.browser_manager.close()
             self.browser_manager = None
+
+    def _return_to_course_list_after_task(self) -> None:
+        """任务结束后回到课程列表页，并刷新内存中的课程列表。
+
+        GUI 模式下完成一门课后不应该关闭浏览器，而是回到课程列表，方便用户继续
+        选择其它课程学习。
+        """
+
+        try:
+            page = self._ensure_page()
+            self._notify_status(status="running", message="当前课程任务完成，正在返回课程列表...")
+            course_manager = CourseManager(page)
+            self.courses = course_manager.get_courses()
+            self._notify_status(
+                status="success",
+                progress=100.0,
+                chapter_name="",
+                message=f"任务完成，已返回课程列表，可继续选择其他课程（共 {len(self.courses)} 门）",
+            )
+        except Exception as exc:  # noqa: BLE001 - 返回列表失败不应该把已完成任务判失败
+            logger.warning("任务完成后返回课程列表失败，浏览器仍然保留: %s", exc)
+            self._notify_status(
+                status="success",
+                progress=100.0,
+                chapter_name="",
+                message="任务完成，但返回课程列表失败，浏览器窗口已保留",
+            )
 
     def start_task(self, course_name: Optional[str] = None) -> Dict[str, Any]:
         """启动自动学习任务。
@@ -224,6 +254,9 @@ class ChaoxingAutomationEngine:
         """从 GUI 中用户选择的课程开始学习。"""
 
         self._stop_requested = False
+        self.current_course = dict(course)
+        self._resume_chapter_index = 0
+        self._resume_card_index = 0
         page: Optional[Page] = None
         course_name = (course.get("name") or "").strip()
         self._notify_status(
@@ -247,11 +280,11 @@ class ChaoxingAutomationEngine:
             logger.info("当前课程: %s", opened_name)
             debug_pause(page, self.debug_mode, "进入课程完成")
 
-            self._learn_open_course(page)
+            self._learn_open_course(page, start_index=0)
             if self._stop_requested:
                 self._notify_status(status="stopped", message="任务已暂停，浏览器窗口已保留")
             else:
-                self._notify_status(status="success", progress=100.0, message="任务完成")
+                self._return_to_course_list_after_task()
             return self.get_status()
         except Exception as exc:
             if page is not None:
@@ -260,10 +293,58 @@ class ChaoxingAutomationEngine:
             logger.exception("选中课程学习失败: %s", exc)
             return self.get_status()
         finally:
+            logger.info("选中课程任务结束，保留浏览器窗口")
+
+    def resume_task(self) -> Dict[str, Any]:
+        """继续上一次被暂停的课程任务。
+
+        继续时复用已经保留的浏览器窗口，并从暂停时所在章节重新开始。
+        """
+
+        if self.current_course is None:
+            self._notify_status(status="failed", message="没有可继续的课程任务，请先选择课程开始学习")
+            return self.get_status()
+
+        self._stop_requested = False
+        page: Optional[Page] = None
+        course_name = (self.current_course.get("name") or self.course_name or "").strip()
+        start_index = max(0, int(self._resume_chapter_index or 0))
+        card_start_index = max(0, int(self._resume_card_index or 0))
+        self._notify_status(
+            status="running",
+            course_name=course_name,
+            message=(
+                f"继续任务：{course_name or '当前课程'}，"
+                f"从第 {start_index + 1} 个章节、第 {card_start_index + 1} 个卡片开始"
+            ),
+        )
+
+        try:
+            page = self._ensure_page()
+            course_manager = CourseManager(page)
+            opened_course = course_manager.open_course_item(self.current_course)
+            opened_name = opened_course.get("name", course_name)
+            self._notify_status(
+                status="running",
+                course_name=opened_name,
+                message=f"已重新进入课程，继续学习: {opened_name}",
+            )
+            logger.info("继续课程: %s，从章节索引 %s、卡片索引 %s 开始", opened_name, start_index, card_start_index)
+
+            self._learn_open_course(page, start_index=start_index)
             if self._stop_requested:
-                logger.info("任务已暂停，保留浏览器窗口")
+                self._notify_status(status="stopped", message="任务已再次暂停，浏览器窗口已保留")
             else:
-                self.close()
+                self._return_to_course_list_after_task()
+            return self.get_status()
+        except Exception as exc:
+            if page is not None:
+                save_screenshot(page, "error_resume_task")
+            self._notify_status(status="failed", message=str(exc))
+            logger.exception("继续任务失败: %s", exc)
+            return self.get_status()
+        finally:
+            logger.info("继续任务结束，保留浏览器窗口")
 
     def run(self) -> None:
         """完整自动化流程。
@@ -302,7 +383,7 @@ class ChaoxingAutomationEngine:
         finally:
             self.close()
 
-    def _learn_open_course(self, page: Page) -> None:
+    def _learn_open_course(self, page: Page, start_index: int = 0) -> None:
         """学习当前已经打开的课程页面。"""
 
         chapter_manager = ChapterManager(page)
@@ -311,15 +392,62 @@ class ChaoxingAutomationEngine:
             raise RuntimeError("未获取到章节列表，请检查课程页面结构或选择器")
 
         total = len(chapters)
-        logger.info("开始遍历章节，总数: %s", total)
-        self._notify_status(status="running", message=f"获取到 {total} 个章节，开始学习")
+        start_index = max(0, min(start_index, total))
+        if start_index >= total:
+            self._notify_status(status="success", progress=100.0, message="课程章节已全部处理完成")
+            return
 
-        for index, chapter in enumerate(chapters, start=1):
+        logger.info("开始遍历章节，总数: %s", total)
+        if start_index:
+            self._notify_status(status="running", message=f"获取到 {total} 个章节，从第 {start_index + 1} 个章节继续")
+        else:
+            self._notify_status(status="running", message=f"获取到 {total} 个章节，开始学习")
+
+        for index, chapter in enumerate(chapters[start_index:], start=start_index + 1):
             if self._stop_requested:
                 logger.info("任务已暂停，退出章节循环并保留浏览器")
                 break
 
             chapter_title = chapter.get("title", f"第 {index} 个章节")
+            self._resume_chapter_index = index - 1
+            if index - 1 != start_index:
+                self._resume_card_index = 0
+
+            status_source = chapter.get("status_source") or "未显示"
+            status_class = chapter.get("status_class") or "未显示"
+            status_decision = chapter.get("status_decision") or "未找到明确状态，按未完成处理"
+            status_message = (
+                f"页面标识判断 [{index}/{total}]: {chapter_title} | "
+                f"source={status_source} | class=\"{status_class}\" | {status_decision}"
+            )
+            logger.info(
+                "先判断章节完成状态 [%s/%s]: %s completed=%s source=%s class=%s decision=%s status=%s",
+                index,
+                total,
+                chapter_title,
+                chapter.get("completed"),
+                status_source,
+                status_class,
+                status_decision,
+                chapter.get("status_text") or "未显示",
+            )
+            self._notify_status(
+                status="running",
+                chapter_name=chapter_title,
+                progress=round((index - 1) / total * 100, 2),
+                message=status_message,
+            )
+            if ChapterManager.is_completed_item(chapter):
+                self._resume_chapter_index = index
+                self._resume_card_index = 0
+                self._notify_status(
+                    chapter_name=chapter_title,
+                    progress=round(index / total * 100, 2),
+                    message=f"{status_decision}；章节已完成，跳过: {chapter_title}",
+                )
+                logger.info("章节已完成，跳过 [%s/%s]: %s", index, total, chapter_title)
+                continue
+
             self._notify_status(
                 status="running",
                 chapter_name=chapter_title,
@@ -332,38 +460,182 @@ class ChaoxingAutomationEngine:
                 chapter_manager.open_chapter(chapter)
                 debug_pause(page, self.debug_mode, f"章节已打开: {chapter_title}")
 
-                video_player = VideoPlayer(page)
-                if not video_player.has_video():
-                    logger.warning("章节未检测到视频，跳过: %s", chapter_title)
-                    self._notify_status(message=f"章节无视频，已跳过: {chapter_title}")
+                cards = chapter_manager.get_cards()
+                if cards:
+                    card_start = self._resume_card_index if index - 1 == start_index else 0
+                    paused = self._learn_chapter_cards(
+                        page=page,
+                        chapter_manager=chapter_manager,
+                        chapter_title=chapter_title,
+                        chapter_index=index,
+                        chapter_total=total,
+                        cards=cards,
+                        start_card_index=card_start,
+                    )
+                    if paused:
+                        self._notify_status(message=f"任务暂停于章节: {chapter_title}")
+                        break
+                    self._resume_chapter_index = index
+                    self._resume_card_index = 0
+                    self._notify_status(progress=round(index / total * 100, 2), message=f"章节完成: {chapter_title}")
+                    logger.info("章节卡片全部处理完成 [%s/%s]: %s", index, total, chapter_title)
                     continue
 
-                def on_progress(video_progress: float, _: Dict[str, float]) -> None:
-                    # 总任务进度 = 已完成章节 + 当前视频章节进度。
-                    overall = ((index - 1) + video_progress / 100) / total * 100
-                    self._notify_status(
-                        progress=overall,
-                        message=f"章节视频播放中: {chapter_title}，视频进度 {video_progress:.2f}%",
-                    )
-
-                played = video_player.play(on_progress=on_progress, should_stop=lambda: self._stop_requested)
+                played = self._play_current_video_unit(
+                    page=page,
+                    unit_title=chapter_title,
+                    chapter_index=index,
+                    chapter_total=total,
+                    unit_index=1,
+                    unit_total=1,
+                )
                 if self._stop_requested or not played:
                     self._notify_status(message=f"任务暂停于章节: {chapter_title}")
                     break
+                self._resume_chapter_index = index
+                self._resume_card_index = 0
                 self._notify_status(progress=round(index / total * 100, 2), message=f"章节完成: {chapter_title}")
                 logger.info("章节完成 [%s/%s]: %s", index, total, chapter_title)
             except VideoNotFoundError:
-                logger.warning("章节视频不存在，继续下一章: %s", chapter_title)
-                self._notify_status(message=f"章节无视频，已跳过: {chapter_title}")
+                logger.warning("未完成章节未检测到视频或卡片视频，继续下一章: %s", chapter_title)
+                self._notify_status(message=f"未完成章节未检测到视频，已跳过: {chapter_title}")
+                self._resume_chapter_index = index
+                self._resume_card_index = 0
             except Exception as exc:
                 save_screenshot(page, f"error_chapter_{index}")
                 logger.exception("章节处理失败，继续下一章节: %s，错误: %s", chapter_title, exc)
                 self._notify_status(message=f"章节处理失败，已跳过: {chapter_title}")
                 if self.debug_mode and PAUSE_ON_ERROR:
                     debug_pause(page, True, f"章节异常: {chapter_title}")
+                self._resume_chapter_index = index
+                self._resume_card_index = 0
                 continue
 
         logger.info("自动学习流程结束")
+
+    def _learn_chapter_cards(
+        self,
+        *,
+        page: Page,
+        chapter_manager: ChapterManager,
+        chapter_title: str,
+        chapter_index: int,
+        chapter_total: int,
+        cards: List[Dict[str, str]],
+        start_card_index: int = 0,
+    ) -> bool:
+        """逐个点击并处理当前章节内的卡片。
+
+        Returns:
+            bool: True 表示任务被暂停；False 表示本章节卡片已处理完。
+        """
+
+        card_total = len(cards)
+        start_card_index = max(0, min(start_card_index, card_total))
+        logger.info("章节 [%s] 检测到 %s 个卡片，从第 %s 个开始", chapter_title, card_total, start_card_index + 1)
+
+        for card_index, card in enumerate(cards[start_card_index:], start=start_card_index + 1):
+            if self._stop_requested:
+                self._resume_card_index = card_index - 1
+                return True
+
+            card_title = card.get("title") or f"卡片 {card_index}"
+            self._resume_chapter_index = chapter_index - 1
+            self._resume_card_index = card_index - 1
+
+            if ChapterManager.is_completed_item(card):
+                self._resume_card_index = card_index
+                self._notify_status(
+                    chapter_name=f"{chapter_title} / {card_title}",
+                    message=f"章节卡片已完成，跳过 [{card_index}/{card_total}]: {card_title}",
+                )
+                logger.info("章节卡片已完成，跳过 [%s/%s]: %s", card_index, card_total, card_title)
+                continue
+
+            self._notify_status(
+                status="running",
+                chapter_name=f"{chapter_title} / {card_title}",
+                message=f"正在处理章节卡片 [{card_index}/{card_total}]: {card_title}",
+            )
+
+            try:
+                chapter_manager.open_card(card)
+                debug_pause(page, self.debug_mode, f"章节卡片已打开: {card_title}")
+
+                try:
+                    played = self._play_current_video_unit(
+                        page=page,
+                        unit_title=f"{chapter_title} / {card_title}",
+                        chapter_index=chapter_index,
+                        chapter_total=chapter_total,
+                        unit_index=card_index,
+                        unit_total=card_total,
+                    )
+                except VideoNotFoundError:
+                    logger.info("章节卡片未检测到视频，跳过: %s / %s", chapter_title, card_title)
+                    self._notify_status(message=f"章节卡片无视频，已跳过: {card_title}")
+                    self._resume_card_index = card_index
+                    continue
+
+                if self._stop_requested or not played:
+                    self._resume_card_index = card_index - 1
+                    return True
+
+                self._resume_card_index = card_index
+                logger.info("章节卡片完成 [%s/%s]: %s", card_index, card_total, card_title)
+            except Exception as exc:
+                save_screenshot(page, f"error_card_{chapter_index}_{card_index}")
+                logger.exception("章节卡片处理失败，继续下一卡片: %s，错误: %s", card_title, exc)
+                self._notify_status(message=f"章节卡片处理失败，已跳过: {card_title}")
+                self._resume_card_index = card_index
+                if self.debug_mode and PAUSE_ON_ERROR:
+                    debug_pause(page, True, f"章节卡片异常: {card_title}")
+                continue
+
+        return False
+
+    def _play_current_video_unit(
+        self,
+        *,
+        page: Page,
+        unit_title: str,
+        chapter_index: int,
+        chapter_total: int,
+        unit_index: int,
+        unit_total: int,
+    ) -> bool:
+        """播放当前页面/卡片中的视频，并按章节和卡片数量折算总进度。"""
+
+        video_player = VideoPlayer(page)
+        if not video_player.has_video(timeout=8000):
+            raise VideoNotFoundError("当前页面或卡片未检测到视频")
+
+        task_status = video_player.get_video_task_status(timeout=8000)
+        task_point_status = str(task_status.get("status") or "unknown")
+        if task_point_status != "unfinished":
+            if task_point_status == "completed":
+                message = f"视频任务点已完成，跳过播放: {unit_title}"
+            else:
+                message = f"未检测到明确“任务点未完成”状态，跳过播放: {unit_title}"
+            self._notify_status(
+                message=message,
+            )
+            logger.info(message)
+            return True
+
+        unit_total = max(1, unit_total)
+        unit_index = max(1, unit_index)
+
+        def on_progress(video_progress: float, _: Dict[str, float]) -> None:
+            # 总进度 = 已完成章节 + 当前章节内已完成卡片 + 当前视频进度。
+            current_chapter_fraction = ((unit_index - 1) + video_progress / 100) / unit_total
+            overall = ((chapter_index - 1) + current_chapter_fraction) / chapter_total * 100
+            self._notify_status(
+                progress=overall,
+                message=f"视频播放中: {unit_title}，视频进度 {video_progress:.2f}%",
+            )
+
+        return video_player.play(on_progress=on_progress, should_stop=lambda: self._stop_requested)
 
 
 def parse_args() -> argparse.Namespace:
