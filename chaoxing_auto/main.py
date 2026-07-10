@@ -478,7 +478,10 @@ class ChaoxingAutomationEngine:
 
             try:
                 chapter_manager.open_chapter(chapter)
-                debug_pause(page, self.debug_mode, f"章节已打开: {chapter_title}")
+                if QuestionManager.is_question_like_title(chapter_title):
+                    logger.info("测验/题目章节跳过 debug pause，避免页面 debugger 导致自动化暂停: %s", chapter_title)
+                else:
+                    debug_pause(page, self.debug_mode, f"章节已打开: {chapter_title}")
 
                 if QuestionManager.is_question_like_title(chapter_title) and self._handle_question_page(
                     question_manager,
@@ -599,7 +602,10 @@ class ChaoxingAutomationEngine:
 
             try:
                 chapter_manager.open_card(card)
-                debug_pause(page, self.debug_mode, f"章节卡片已打开: {card_title}")
+                if QuestionManager.is_question_like_title(card_title):
+                    logger.info("测验/题目卡片跳过 debug pause，避免页面 debugger 导致自动化暂停: %s", card_title)
+                else:
+                    debug_pause(page, self.debug_mode, f"章节卡片已打开: {card_title}")
 
                 try:
                     played = self._play_current_video_unit(

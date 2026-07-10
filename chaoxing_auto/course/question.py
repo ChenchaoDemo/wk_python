@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from html import unescape
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.sync_api import Page, Response
 
@@ -840,6 +841,34 @@ class QuestionManager:
                     "message": "没有可执行的答题计划",
                 }
 
+            logger.info("单元测试答题计划已生成: questions=%s planned=%s", len(questions), len(answer_plan))
+            if submit and os.getenv("CHAOXING_DIRECT_SUBMIT_FROM_SNAPSHOT", "true").lower() in {"1", "true", "yes", "y"}:
+                direct_submit_result = self._submit_answer_plan_from_snapshot(snapshot, answer_plan)
+                if direct_submit_result.get("submitted"):
+                    return {
+                        "answered": True,
+                        "submitted": True,
+                        "question_count": len(questions),
+                        "planned_count": len(answer_plan),
+                        "plan": answer_plan,
+                        "submit_result": direct_submit_result,
+                        "message": direct_submit_result.get("message") or "已通过题目接口直接提交",
+                    }
+                logger.warning("题目接口直提交未成功: %s", direct_submit_result.get("message"))
+                if (snapshot or {}).get("raw_path") and os.getenv(
+                    "CHAOXING_FALLBACK_DOM_AFTER_DIRECT_SUBMIT",
+                    "false",
+                ).lower() not in {"1", "true", "yes", "y"}:
+                    return {
+                        "answered": False,
+                        "submitted": False,
+                        "question_count": len(questions),
+                        "planned_count": len(answer_plan),
+                        "plan": answer_plan,
+                        "missing": [direct_submit_result.get("message") or "题目接口直提交未成功"],
+                        "message": direct_submit_result.get("message") or "题目接口直提交未成功，已跳过 DOM 操作避免 debugger 卡死",
+                    }
+
             apply_result = self._apply_answer_plan(answer_plan)
             if not apply_result.get("ok"):
                 return {
@@ -1105,15 +1134,219 @@ class QuestionManager:
         plan = [plan_by_index[index] for index in sorted(plan_by_index)]
         return {"plan": plan, "missing": missing}
 
-    def _apply_answer_plan(self, answer_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _submit_answer_plan_from_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        answer_plan: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """不依赖浏览器 DOM，直接用题目接口抓到的 form HTML 提交答案。"""
+
+        raw_path = os.path.abspath(str((snapshot or {}).get("raw_path") or ""))
+        snapshot_url = str((snapshot or {}).get("url") or self.page.url or "")
+        if not raw_path or not os.path.exists(raw_path):
+            return {"submitted": False, "message": "snapshot 没有 raw_path，不能接口直提交"}
+
         try:
-            self.page.wait_for_selector(".TiMu", timeout=10000)
-        except Exception:
-            pass
+            html_text = open(raw_path, "r", encoding="utf-8", errors="replace").read()
+            form_match = re.search(
+                r'(?is)<form\b[^>]*(?:id\s*=\s*["\']form1["\']|name\s*=\s*["\']form1["\'])[^>]*>',
+                html_text,
+            )
+            if not form_match:
+                return {"submitted": False, "message": "raw HTML 未找到 form1"}
+
+            form_tag = form_match.group(0)
+            form_attrs = self._attrs_from_tag(form_tag)
+            action = form_attrs.get("action") or ""
+            method = (form_attrs.get("method") or "post").lower()
+            if not action:
+                return {"submitted": False, "message": "form1 缺少 action"}
+
+            action_url = urljoin(snapshot_url, action)
+            action_url = self._append_submit_query(action_url, method)
+            form_end = html_text.find("</form>", form_match.end())
+            form_html = html_text[form_match.end() : form_end if form_end != -1 else len(html_text)]
+
+            fields: List[tuple[str, str]] = []
+            skipped_names: set[str] = set()
+
+            for input_match in re.finditer(r"(?is)<input\b[^>]*>", form_html):
+                attrs = self._attrs_from_tag(input_match.group(0))
+                name = attrs.get("name") or ""
+                if not name:
+                    continue
+                input_type = (attrs.get("type") or "text").lower()
+                if input_type in {"radio", "checkbox"} and "checked" not in attrs:
+                    continue
+                fields.append((name, attrs.get("value") or ""))
+
+            random_options = any(
+                name == "randomOptions" and str(value).strip().lower() not in {"", "0", "false", "no"}
+                for name, value in fields
+            )
+
+            def set_field(name: str, value: str) -> None:
+                skipped_names.add(name)
+                fields.append((name, value))
+
+            question_ids: List[str] = []
+            for item in answer_plan:
+                qid = str(item.get("id") or "")
+                if not qid:
+                    continue
+                question_ids.append(qid)
+                values = [str(answer.get("value") or "") for answer in item.get("answers") or [] if answer.get("value")]
+                if not values:
+                    continue
+                # 学习通多选题最终靠隐藏字段 answer{id}=拼接后的真实 value；
+                # 单选题直接提交 answer{id}=value。
+                is_multiple = len(values) > 1 or str(item.get("type") or "").lower() == "multiple"
+                hidden_values = sorted(values) if is_multiple and random_options else values
+                set_field(f"answer{qid}", "".join(hidden_values) if is_multiple else values[0])
+                if is_multiple:
+                    for value in values:
+                        fields.append((f"answercheck{qid}", value))
+
+            set_field("answerwqbid", ",".join(question_ids) + ("," if question_ids else ""))
+            set_field("pyFlag", "")
+
+            filtered_fields = [
+                (name, value)
+                for name, value in fields
+                if name not in skipped_names and not name.startswith("answercheck")
+            ]
+            # set_field 追加的字段应位于最后，覆盖 HTML 原始空值。
+            for name in ("answerwqbid", "pyFlag", *[f"answer{qid}" for qid in question_ids]):
+                values = [value for field_name, value in fields if field_name == name and field_name in skipped_names]
+                if values:
+                    filtered_fields.append((name, values[-1]))
+            for name, value in fields:
+                if name.startswith("answercheck"):
+                    filtered_fields.append((name, value))
+
+            encoded = urlencode(filtered_fields, doseq=True)
+            logger.info(
+                "准备通过题目接口直提交: questions=%s url=%s fields=%s",
+                len(question_ids),
+                action_url,
+                len(filtered_fields),
+            )
+
+            response = self.page.context.request.post(
+                action_url,
+                data=encoded,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer": snapshot_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=30000,
+            )
+            body = response.text()
+            logger.info("题目接口直提交响应: status=%s body=%s", response.status, body[:500])
+
+            submitted = response.ok and bool(
+                re.search(r'"status"\s*:\s*(true|1)', body, re.I)
+                or re.search(r'"stuStatus"\s*:', body, re.I)
+                or re.search(r'"url"\s*:', body, re.I)
+                or re.search(r'"backUrl"\s*:', body, re.I)
+            )
+            if submitted:
+                return {
+                    "submitted": True,
+                    "message": "已通过题目接口直接提交",
+                    "status": response.status,
+                    "response": body[:1000],
+                }
+            return {
+                "submitted": False,
+                "message": f"接口直提交响应未确认成功: HTTP {response.status} {body[:300]}",
+                "status": response.status,
+                "response": body[:1000],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("题目接口直提交失败: %s", exc)
+            return {"submitted": False, "message": f"接口直提交失败: {exc}"}
+
+    @staticmethod
+    def _append_submit_query(url: str, method: str) -> str:
+        """模拟页面 version(document.form1.action) 追加的提交参数。"""
+
+        parts = urlsplit(url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        existing = {key for key, _ in query}
+        additions = {
+            "ua": "pc",
+            "formType": method or "post",
+            "saveStatus": "1",
+            "pos": "",
+        }
+        for key, value in additions.items():
+            if key not in existing:
+                query.append((key, value))
+        if "version" not in existing:
+            query.append(("version", "1"))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    def _find_question_frames(self) -> List[Any]:
+        """查找包含学习通作业/题目 DOM 的 frame。"""
+
+        candidates: List[tuple[int, Any, Dict[str, Any]]] = []
+        for frame in self.page.frames:
+            try:
+                timu_count = frame.locator(".TiMu").count()
+                form_count = frame.locator("form#form1, #form1").count()
+                answer_controls = frame.locator(
+                    'input[name^="answer"], input[name^="answercheck"], textarea[name^="answer"]'
+                ).count()
+                url = frame.url
+                info = {
+                    "url": url,
+                    "hasTimu": timu_count > 0,
+                    "hasForm1": form_count > 0,
+                    "hasSubmit": bool(re.search(r"/work/|doHomeWork|addStudentWork|workHandle", url or "", re.I)),
+                    "answerControls": answer_controls,
+                }
+                score = 0
+                if info.get("hasTimu"):
+                    score += 100
+                if info.get("hasForm1"):
+                    score += 50
+                if info.get("hasSubmit"):
+                    score += 30
+                score += min(int(info.get("answerControls") or 0), 20)
+                if score > 0:
+                    candidates.append((score, frame, info))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("扫描题目 frame 失败: %s", exc)
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for score, frame, info in candidates[:5]:
+            logger.info(
+                "发现题目 frame: score=%s name=%s url=%s hasTimu=%s hasForm1=%s controls=%s",
+                score,
+                frame.name,
+                info.get("url") or frame.url,
+                info.get("hasTimu"),
+                info.get("hasForm1"),
+                info.get("answerControls"),
+            )
+        return [frame for _, frame, _ in candidates]
+
+    def _apply_answer_plan(self, answer_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
+        logger.info("开始勾选单元测试答案: planned=%s", len(answer_plan))
 
         script = """
             (answerPlan) => {
-                const result = { ok: true, applied: [], missing: [] };
+                const result = {
+                    ok: true,
+                    applied: [],
+                    missing: [],
+                    hasQuestionDom: !!document.querySelector('.TiMu'),
+                    hasForm1: !!document.querySelector('form#form1, #form1'),
+                    url: location.href,
+                    title: document.title || ''
+                };
                 const dispatch = (node) => {
                     node.dispatchEvent(new Event('input', { bubbles: true }));
                     node.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1137,6 +1370,9 @@ class QuestionManager:
                                 input.click();
                             }
                             input.checked = shouldCheck;
+                            if (input.parentElement && input.parentElement.setAttribute) {
+                                input.parentElement.setAttribute('aria-checked', shouldCheck ? 'true' : 'false');
+                            }
                             dispatch(input);
                         });
                         const hidden = document.getElementById(`answer${qid}`);
@@ -1175,53 +1411,126 @@ class QuestionManager:
                 return result;
             }
         """
-        result = self.page.evaluate(script, answer_plan)
-        logger.info("单元测试答案已勾选: %s", result)
-        return result
+
+        frames = self._find_question_frames()
+        if not frames:
+            logger.warning("未找到题目 frame，尝试在主页面勾选答案")
+            frames = [self.page.main_frame]
+
+        last_result: Dict[str, Any] = {"ok": False, "missing": [{"reason": "未执行"}]}
+        expected_count = len(answer_plan)
+        for frame in frames:
+            try:
+                logger.info("在题目 frame 内勾选答案: name=%s url=%s", frame.name, frame.url)
+                result = frame.evaluate(script, answer_plan)
+                last_result = result
+                logger.info("题目 frame 勾选结果: %s", result)
+                if len(result.get("applied") or []) >= expected_count and result.get("ok"):
+                    logger.info("单元测试答案已勾选: %s", result)
+                    return result
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("题目 frame 勾选失败 name=%s url=%s: %s", frame.name, frame.url, exc)
+
+        logger.info("单元测试答案勾选最终结果: %s", last_result)
+        return last_result
 
     def _submit_answered_work(self) -> Dict[str, Any]:
         """执行学习通页面自己的提交流程。"""
 
         try:
-            self.page.evaluate(
-                """
-                () => {
-                    if (typeof btnBlueSubmit === 'function') {
-                        btnBlueSubmit();
-                    } else if (typeof toadd === 'function') {
-                        toadd(['']);
-                    }
-                }
-                """
-            )
-            try:
-                self.page.wait_for_selector("#confirmSubWin", state="visible", timeout=12000)
-                self.page.evaluate(
-                    """
-                    () => {
-                        if (typeof submitCheckTimes === 'function') {
-                            submitCheckTimes();
-                        } else if (typeof form1submit === 'function') {
-                            form1submit();
+            frames = self._find_question_frames()
+            if not frames:
+                frames = [self.page.main_frame]
+
+            last_message = "未找到可提交的题目 frame"
+            for frame in frames:
+                try:
+                    logger.info("准备在题目 frame 内提交: name=%s url=%s", frame.name, frame.url)
+                    trigger_result = frame.evaluate(
+                        """
+                        () => {
+                            if (typeof btnBlueSubmit === 'function') {
+                                btnBlueSubmit();
+                                return { ok: true, trigger: 'btnBlueSubmit' };
+                            }
+                            if (typeof toadd === 'function') {
+                                toadd(['', '']);
+                                return { ok: true, trigger: 'toadd' };
+                            }
+                            if (typeof form1submit === 'function') {
+                                form1submit();
+                                return { ok: true, trigger: 'form1submit_direct' };
+                            }
+                            if (typeof confirmSubmitWork === 'function') {
+                                confirmSubmitWork();
+                                return { ok: true, trigger: 'confirmSubmitWork_direct' };
+                            }
+                            return { ok: false, trigger: 'no_submit_function' };
                         }
-                    }
-                    """
-                )
-            except Exception:
-                self.page.evaluate(
-                    """
-                    () => {
-                        if (typeof form1submit === 'function') {
-                            form1submit();
-                        } else if (typeof confirmSubmitWork === 'function') {
-                            confirmSubmitWork();
+                        """
+                    )
+                    logger.info("单元测试提交触发结果: %s", trigger_result)
+                    if not trigger_result.get("ok"):
+                        last_message = str(trigger_result)
+                        continue
+
+                    try:
+                        frame.wait_for_selector("#confirmSubWin", state="visible", timeout=12000)
+                    except Exception:
+                        retry_result = frame.evaluate(
+                            """
+                            () => {
+                                if (typeof toadd === 'function') {
+                                    toadd(['', '']);
+                                    return { ok: true, trigger: 'toadd_retry' };
+                                }
+                                return { ok: false, trigger: 'confirm_not_visible' };
+                            }
+                            """
+                        )
+                        logger.info("确认框未出现，重试打开确认框: %s", retry_result)
+                        if retry_result.get("ok"):
+                            try:
+                                frame.wait_for_selector("#confirmSubWin", state="visible", timeout=5000)
+                            except Exception:
+                                pass
+
+                    confirm_result = frame.evaluate(
+                        """
+                        () => {
+                            if (typeof submitCheckTimes === 'function') {
+                                submitCheckTimes();
+                                return { ok: true, trigger: 'submitCheckTimes' };
+                            }
+                            if (typeof form1submit === 'function') {
+                                form1submit();
+                                return { ok: true, trigger: 'form1submit' };
+                            }
+                            if (typeof confirmSubmitWork === 'function') {
+                                confirmSubmitWork();
+                                return { ok: true, trigger: 'confirmSubmitWork' };
+                            }
+                            const button = document.querySelector('#confirmSubWin a.bluebtn, #confirmSubWin .bluebtn');
+                            if (button) {
+                                button.click();
+                                return { ok: true, trigger: 'confirm_button_click' };
+                            }
+                            return { ok: false, trigger: 'no_confirm_submit_function' };
                         }
-                    }
-                    """
-                )
-            self.page.wait_for_timeout(3000)
-            logger.info("单元测试已触发提交")
-            return {"submitted": True, "message": "已自动答题并触发提交"}
+                        """
+                    )
+                    logger.info("单元测试确认提交结果: %s", confirm_result)
+                    if confirm_result.get("ok"):
+                        self.page.wait_for_timeout(3000)
+                        logger.info("单元测试已触发提交")
+                        return {"submitted": True, "message": "已自动答题并触发提交"}
+                    last_message = str(confirm_result)
+                except Exception as exc:  # noqa: BLE001
+                    last_message = str(exc)
+                    logger.warning("当前题目 frame 提交失败，尝试下一个 frame: %s", exc)
+
+            logger.warning("单元测试提交失败: %s", last_message)
+            return {"submitted": False, "message": f"提交失败: {last_message}"}
         except Exception as exc:  # noqa: BLE001
             logger.warning("单元测试提交失败: %s", exc)
             return {"submitted": False, "message": f"提交失败: {exc}"}
