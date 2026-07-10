@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -659,6 +660,20 @@ class ChaoxingAutomationEngine:
                     message += f"，结构文件: {dump_path}"
                 if raw_path:
                     message += f"，原始响应: {raw_path}"
+                if os.getenv("CHAOXING_AUTO_ANSWER_QUESTIONS", "true").lower() in {"1", "true", "yes", "y"}:
+                    auto_result = question_manager.answer_and_submit_current_page(
+                        recent_snapshot,
+                        label=label,
+                        submit=os.getenv("CHAOXING_AUTO_SUBMIT_QUESTIONS", "true").lower()
+                        in {"1", "true", "yes", "y"},
+                    )
+                    if auto_result.get("answered"):
+                        if auto_result.get("submitted"):
+                            message += "，已自动答题并提交"
+                        else:
+                            message += "，已自动答题但未提交"
+                    else:
+                        message += f"，自动答题跳过: {auto_result.get('message')}"
                 self._notify_status(message=message)
                 logger.info(message)
                 return True
@@ -686,6 +701,20 @@ class ChaoxingAutomationEngine:
             )
             if dump_path:
                 message += f"，文件: {dump_path}"
+            if os.getenv("CHAOXING_AUTO_ANSWER_QUESTIONS", "true").lower() in {"1", "true", "yes", "y"}:
+                auto_result = question_manager.answer_and_submit_current_page(
+                    info,
+                    label=label,
+                    submit=os.getenv("CHAOXING_AUTO_SUBMIT_QUESTIONS", "true").lower()
+                    in {"1", "true", "yes", "y"},
+                )
+                if auto_result.get("answered"):
+                    if auto_result.get("submitted"):
+                        message += "，已自动答题并提交"
+                    else:
+                        message += "，已自动答题但未提交"
+                else:
+                    message += f"，自动答题跳过: {auto_result.get('message')}"
             self._notify_status(message=message)
             logger.info(message)
             return True
