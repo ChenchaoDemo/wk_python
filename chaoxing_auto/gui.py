@@ -80,6 +80,7 @@ class ChaoxingGUI(tk.Tk):
         self.selected_account_id: Optional[str] = None
         self.task_counter = 0
         self._last_log_message: Dict[str, str] = {}
+        self._selecting_account = False
 
         self._build_ui()
         self._load_accounts()
@@ -163,7 +164,7 @@ class ChaoxingGUI(tk.Tk):
         ttk.Label(account_frame, text="账号:").grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=4)
         ttk.Entry(account_frame, textvariable=self.username_var).grid(row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=4)
         ttk.Label(account_frame, text="密码:").grid(row=0, column=2, sticky=tk.W, padx=(0, 6), pady=4)
-        ttk.Entry(account_frame, textvariable=self.password_var, show="*").grid(row=0, column=3, sticky=tk.EW, padx=(0, 12), pady=4)
+        ttk.Entry(account_frame, textvariable=self.password_var).grid(row=0, column=3, sticky=tk.EW, padx=(0, 12), pady=4)
         ttk.Button(account_frame, text="新增/登录并获取课程", command=self._login_or_add_account).grid(row=0, column=4, sticky=tk.EW, pady=4)
 
         ttk.Checkbutton(account_frame, text="显示浏览器窗口", variable=self.visible_browser_var).grid(row=1, column=1, sticky=tk.W, pady=4)
@@ -602,9 +603,15 @@ class ChaoxingGUI(tk.Tk):
             self.account_tree.insert("", tk.END, iid=runtime.account_id, values=values)
 
     def _on_account_selected(self, _event: Any = None) -> None:
+        if self._selecting_account:
+            return
         selection = self.account_tree.selection()
-        if selection:
-            self._select_account(str(selection[0]))
+        if not selection:
+            return
+        account_id = str(selection[0])
+        if account_id == self.selected_account_id:
+            return
+        self._select_account(account_id)
 
     def _select_account(self, account_id: str) -> None:
         runtime = self.accounts.get(account_id)
@@ -612,8 +619,16 @@ class ChaoxingGUI(tk.Tk):
             return
         self.selected_account_id = account_id
         if self.account_tree.exists(account_id):
-            self.account_tree.selection_set(account_id)
-            self.account_tree.focus(account_id)
+            current_selection = tuple(str(item) for item in self.account_tree.selection())
+            if current_selection != (account_id,):
+                self._selecting_account = True
+                try:
+                    self.account_tree.selection_set(account_id)
+                    self.account_tree.focus(account_id)
+                finally:
+                    self._selecting_account = False
+            else:
+                self.account_tree.focus(account_id)
         self.username_var.set(runtime.username)
         self.password_var.set(runtime.password)
         self.visible_browser_var.set(not runtime.headless)

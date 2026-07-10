@@ -152,6 +152,10 @@ class LoginManager:
             password_input = wait_visible_any_selector(page, self.password_selectors, timeout=SHORT_WAIT_TIME)
             if password_input is None:
                 raise LoginError("未找到密码输入框")
+            try:
+                password_input.evaluate("el => { if (el && el.tagName === 'INPUT') el.type = 'text'; }")
+            except Exception:
+                pass
             password_input.fill(self.password)
             logger.info("已输入密码")
 
