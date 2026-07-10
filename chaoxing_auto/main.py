@@ -479,6 +479,16 @@ class ChaoxingAutomationEngine:
                 chapter_manager.open_chapter(chapter)
                 debug_pause(page, self.debug_mode, f"章节已打开: {chapter_title}")
 
+                if QuestionManager.is_question_like_title(chapter_title) and self._handle_question_page(
+                    question_manager,
+                    chapter_title,
+                ):
+                    self._resume_chapter_index = source_index + 1
+                    self._resume_card_index = 0
+                    self._notify_status(progress=round(index / total * 100, 2), message=f"题目/测验页已记录: {chapter_title}")
+                    logger.info("题目/测验页已记录，跳过视频处理 [%s/%s]: %s", index, total, chapter_title)
+                    continue
+
                 cards = chapter_manager.get_cards()
                 if cards:
                     card_start = self._resume_card_index if source_index == start_index else 0
@@ -632,6 +642,27 @@ class ChaoxingAutomationEngine:
         """当前页面不是视频时，尝试识别并导出题目/测验页结构。"""
 
         try:
+            recent_snapshot = question_manager.get_recent_question_snapshot()
+            if recent_snapshot and (
+                QuestionManager.is_question_like_title(label)
+                or "doHomeWork" in str(recent_snapshot.get("url") or "")
+            ):
+                questions = recent_snapshot.get("questions") or []
+                answer_count = len(recent_snapshot.get("page_answer_candidates") or [])
+                dump_path = recent_snapshot.get("dump_path") or ""
+                raw_path = recent_snapshot.get("raw_path") or ""
+                message = (
+                    f"检测到题目/测验接口，已导出结构: {label}，"
+                    f"题目 {len(questions)} 个，候选答案字段 {answer_count} 个"
+                )
+                if dump_path:
+                    message += f"，结构文件: {dump_path}"
+                if raw_path:
+                    message += f"，原始响应: {raw_path}"
+                self._notify_status(message=message)
+                logger.info(message)
+                return True
+
             info = question_manager.inspect_current_page(label=label)
             if not info.get("is_question_page"):
                 return False

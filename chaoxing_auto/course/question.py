@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime
+from html import unescape
 from typing import Any, Dict, List
 
 from playwright.sync_api import Page, Response
@@ -41,6 +43,8 @@ class QuestionManager:
 
     def __init__(self, page: Page) -> None:
         self.page = page
+        self.last_question_snapshot: Dict[str, Any] = {}
+        self.last_question_snapshot_time = 0.0
 
     @staticmethod
     def is_question_like_title(text: str) -> bool:
@@ -71,7 +75,11 @@ class QuestionManager:
                 headers = {str(k).lower(): str(v) for k, v in response.headers.items()}
                 content_type = headers.get("content-type", "")
                 content_length = int(headers.get("content-length") or "0")
-                if content_length and content_length > 500_000:
+                is_likely_main_question_url = bool(
+                    re.search(r"/work/doHomeWork|/work/.*Work|/exam/|/question|/test|/quiz|homework", url, re.I)
+                )
+                max_length = 2_000_000 if is_likely_main_question_url else 500_000
+                if content_length and content_length > max_length:
                     return
                 if content_type and not re.search(r"json|text|html|javascript|x-www-form-urlencoded", content_type, re.I):
                     return
@@ -96,7 +104,20 @@ class QuestionManager:
                     record["candidate_count"] = len(candidates)
                     record["candidates"] = candidates[:80]
 
-                    if os.getenv("CHAOXING_QUESTION_DUMP_RAW", "false").lower() in {"1", "true", "yes", "y"}:
+                    is_main_question_response = self._is_main_question_response(url, content_type, body_text)
+                    if is_main_question_response:
+                        snapshot = self._dump_question_response_snapshot(
+                            label=label,
+                            url=url,
+                            content_type=content_type,
+                            body_text=body_text,
+                            candidates=candidates,
+                        )
+                        record["snapshot_path"] = snapshot.get("dump_path", "")
+                        record["raw_path"] = snapshot.get("raw_path", "")
+                        self.last_question_snapshot = snapshot
+                        self.last_question_snapshot_time = time.time()
+                    elif os.getenv("CHAOXING_QUESTION_DUMP_RAW", "false").lower() in {"1", "true", "yes", "y"}:
                         raw_path = LOG_DIR / f"question_response_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.txt"
                         raw_path.write_text(body_text[:500_000], encoding="utf-8", errors="ignore")
                         record["raw_path"] = str(raw_path)
@@ -115,6 +136,77 @@ class QuestionManager:
 
         self.page.on("response", handle_response)
         logger.info("已开启题目接口监听，日志: %s", log_path)
+
+    def get_recent_question_snapshot(self, max_age_seconds: int = 60) -> Dict[str, Any]:
+        """返回最近一次题目主接口快照。"""
+
+        if not self.last_question_snapshot:
+            return {}
+        if time.time() - self.last_question_snapshot_time > max_age_seconds:
+            return {}
+        return dict(self.last_question_snapshot)
+
+    @classmethod
+    def _is_main_question_response(cls, url: str, content_type: str, body_text: str) -> bool:
+        """判断响应是否是题目主页面/主数据，而不是普通 css/js 资源。"""
+
+        url_text = url or ""
+        if re.search(r"\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?|ttf)(?:\?|$)", url_text, re.I):
+            return False
+        if re.search(r"/work/doHomeWork|/work/.*Work|/exam/|/question|/test|/quiz|homework", url_text, re.I):
+            return True
+        if "html" in (content_type or "").lower() and re.search(
+            r"单选题|多选题|判断题|填空题|简答题|提交答案|交卷|doHomeWork|questionId|题目",
+            body_text[:100_000],
+        ):
+            return True
+        return False
+
+    def _dump_question_response_snapshot(
+        self,
+        *,
+        label: str,
+        url: str,
+        content_type: str,
+        body_text: str,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """把题目接口响应保存成 question_page_*.json，避免页面跳转时抓不到 DOM。"""
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe_label = sanitize_filename(label or "network_question")[:60]
+        suffix = ".html" if re.search(r"html|text", content_type or "", re.I) else ".txt"
+        raw_path = LOG_DIR / f"question_response_{timestamp}_{safe_label}{suffix}"
+        raw_path.write_text(body_text[:500_000], encoding="utf-8", errors="ignore")
+
+        questions = self._extract_questions_from_html_text(body_text)
+        snapshot: Dict[str, Any] = {
+            "source": "network_response",
+            "label": label,
+            "url": url,
+            "content_type": content_type,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "is_question_page": True,
+            "raw_path": str(raw_path),
+            "body_length": len(body_text),
+            "question_count": len(questions),
+            "questions": questions,
+            "page_answer_candidates": candidates[:120],
+            "page_text_sample": self._plain_text_from_html(body_text)[:3000],
+        }
+        dump_path = LOG_DIR / f"question_page_{timestamp}_{safe_label}_network.json"
+        dump_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        snapshot["dump_path"] = str(dump_path)
+
+        logger.info(
+            "题目主接口已导出: questions=%s candidates=%s dump=%s raw=%s",
+            len(questions),
+            len(candidates),
+            dump_path,
+            raw_path,
+        )
+        return snapshot
 
     def inspect_current_page(self, label: str = "") -> Dict[str, Any]:
         """分析当前页面是否为题目页，并导出题干、选项和候选答案字段。"""
@@ -396,6 +488,150 @@ class QuestionManager:
             )
         return info
 
+    @staticmethod
+    def _plain_text_from_html(html_text: str) -> str:
+        """把 HTML 粗略转成可读文本。"""
+
+        text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html_text or "")
+        text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+        text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h[1-6]>", "\n", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = unescape(text)
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        return "\n".join(line for line in lines if line)
+
+    @staticmethod
+    def _attrs_from_tag(tag_text: str) -> Dict[str, str]:
+        """解析单个 HTML 标签里的属性。"""
+
+        attrs: Dict[str, str] = {}
+        pattern = re.compile(r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
+        for match in pattern.finditer(tag_text or ""):
+            raw_value = match.group(2).strip()
+            if (raw_value.startswith('"') and raw_value.endswith('"')) or (
+                raw_value.startswith("'") and raw_value.endswith("'")
+            ):
+                raw_value = raw_value[1:-1]
+            attrs[match.group(1)] = unescape(raw_value)
+        return attrs
+
+    @classmethod
+    def _extract_questions_from_html_text(cls, html_text: str) -> List[Dict[str, Any]]:
+        """从题目 HTML 响应里粗略提取题干、选项和表单控件。"""
+
+        plain = cls._plain_text_from_html(html_text)
+        questions: List[Dict[str, Any]] = []
+
+        marker_pattern = re.compile(r"(?:第\s*\d+\s*题|单选题|多选题|判断题|填空题|简答题)", re.I)
+        markers = list(marker_pattern.finditer(plain))
+        blocks: List[str] = []
+        if markers:
+            for index, marker in enumerate(markers[:80]):
+                start = marker.start()
+                end = markers[index + 1].start() if index + 1 < len(markers) else min(len(plain), start + 2500)
+                blocks.append(plain[start:end].strip())
+        else:
+            # 没有明显“第 N 题”时，按包含 A/B/C/D 选项的段落兜底切分。
+            for part in re.split(r"\n{2,}", plain):
+                if re.search(r"(?:^|\s)[A-H][\.、．]\s*.{1,100}(?:\s+[B-H][\.、．]\s*)", part):
+                    blocks.append(part.strip())
+
+        option_pattern = re.compile(
+            r"(?:^|\s)([A-H])[\.\、．]\s*(.{1,260}?)(?=(?:\s+[A-H][\.\、．]\s*)|$)",
+            re.S,
+        )
+        for index, block in enumerate(blocks[:80], start=1):
+            block = re.sub(r"\s+", " ", block).strip()
+            if len(block) < 4:
+                continue
+            options = []
+            for option_index, match in enumerate(option_pattern.finditer(block), start=1):
+                option_text = re.sub(r"\s+", " ", match.group(2)).strip()
+                if not option_text:
+                    continue
+                options.append(
+                    {
+                        "index": option_index,
+                        "letter": match.group(1).upper(),
+                        "text": option_text[:300],
+                    }
+                )
+
+            stem = block
+            if options:
+                first_option = re.search(r"(?:^|\s)[A-H][\.\、．]\s*", block)
+                if first_option:
+                    stem = block[: first_option.start()].strip()
+
+            if "多选" in block:
+                question_type = "multiple"
+            elif "判断" in block:
+                question_type = "judge"
+            elif "填空" in block:
+                question_type = "fill"
+            elif "简答" in block:
+                question_type = "text"
+            elif options:
+                question_type = "single"
+            else:
+                question_type = "unknown"
+
+            questions.append(
+                {
+                    "index": index,
+                    "type": question_type,
+                    "stem": stem[:500],
+                    "text": block[:1200],
+                    "options": options,
+                    "answer_candidates": [],
+                    "source": "network_html",
+                }
+            )
+
+        # 额外记录疑似隐藏答案/标准答案字段，供后续适配。
+        answer_candidates: List[Dict[str, Any]] = []
+        for tag_match in re.finditer(
+            r"(?is)<(?:input|textarea|select|div|span|li|p)[^>]*(?:answer|correct|right|standard|答案|正确)[^>]*>",
+            html_text[:500_000],
+        ):
+            tag_text = tag_match.group(0)
+            attrs = cls._attrs_from_tag(tag_text)
+            if not attrs:
+                continue
+            interesting = {
+                key: value
+                for key, value in attrs.items()
+                if cls.ANSWER_KEY_PATTERN.search(key) or cls.ANSWER_KEY_PATTERN.search(value)
+            }
+            if interesting:
+                answer_candidates.append(
+                    {
+                        "source": "html_attr",
+                        "tag": tag_text[:80],
+                        "attrs": interesting,
+                    }
+                )
+            if len(answer_candidates) >= 80:
+                break
+
+        if answer_candidates:
+            if not questions:
+                questions.append(
+                    {
+                        "index": 1,
+                        "type": "unknown",
+                        "stem": "",
+                        "text": plain[:1200],
+                        "options": [],
+                        "answer_candidates": answer_candidates,
+                        "source": "network_html",
+                    }
+                )
+            else:
+                questions[0]["answer_candidates"] = answer_candidates
+
+        return questions
+
     @classmethod
     def _extract_answer_candidates_from_text(cls, text: str) -> List[Dict[str, Any]]:
         """从接口文本/JSON 里提取疑似答案字段。"""
@@ -409,6 +645,47 @@ class QuestionManager:
             value = re.sub(r"\s+", " ", value).strip()
             return value[:max_length] + ("..." if len(value) > max_length else "")
 
+        def is_noise_value(value: str) -> bool:
+            value = str(value or "").strip()
+            if not value:
+                return True
+            lower = value.lower()
+            noise_tokens = (
+                "$(",
+                "$.",
+                ".val(",
+                "getcontent",
+                "ue.geteditor",
+                "opteditor",
+                "input:",
+                "function",
+                "return ",
+                "var ",
+                "this.",
+                "window.",
+                "document.",
+                "answereditor",
+            )
+            if any(token in lower for token in noise_tokens):
+                return True
+            if len(value) > 300:
+                return True
+            return False
+
+        seen_candidates: set[tuple[str, str, str]] = set()
+
+        def add_candidate(candidate: Dict[str, Any]) -> None:
+            value = shorten(candidate.get("value", ""))
+            if is_noise_value(value):
+                return
+            candidate = dict(candidate)
+            candidate["value"] = value
+            key = (str(candidate.get("source") or ""), str(candidate.get("key") or ""), value)
+            if key in seen_candidates:
+                return
+            seen_candidates.add(key)
+            candidates.append(candidate)
+
         def walk(value: Any, path: str = "$") -> None:
             if len(candidates) >= 200:
                 return
@@ -417,7 +694,7 @@ class QuestionManager:
                     key_text = str(key)
                     current_path = f"{path}.{key_text}"
                     if cls.ANSWER_KEY_PATTERN.search(key_text):
-                        candidates.append(
+                        add_candidate(
                             {
                                 "source": "json",
                                 "path": current_path,
@@ -447,11 +724,11 @@ class QuestionManager:
         for pattern in regex_patterns:
             for match in pattern.finditer(text[:500_000]):
                 value = next((group for group in match.groups()[1:] if group), "")
-                candidates.append(
+                add_candidate(
                     {
                         "source": "regex",
                         "key": match.group(1),
-                        "value": shorten(value),
+                        "value": value,
                     }
                 )
                 if len(candidates) >= 200:

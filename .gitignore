@@ -1,1 +1,5 @@
 chaoxing_auto/config/gui_state.json
+
+# 运行过程中产生的日志和截图不提交
+chaoxing_auto/logs/
+chaoxing_auto/screenshots/

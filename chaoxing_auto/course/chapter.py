@@ -343,7 +343,7 @@ class ChapterManager:
             logger.exception("打开章节失败: %s", exc)
             raise
 
-    def get_cards(self) -> List[Dict[str, str]]:
+    def get_cards(self, retry: bool = True) -> List[Dict[str, str]]:
         """获取当前章节页里的卡片/页签列表。
 
         学习通有些章节不是单一页面，而是在章节页内使用 `.tabtags` 卡片切换内容，
@@ -422,6 +422,14 @@ class ChapterManager:
                     )
             return cleaned
         except Exception as exc:
+            if retry and "Execution context was destroyed" in str(exc):
+                logger.info("页面正在跳转，等待后重试获取章节卡片")
+                try:
+                    wait_page_ready(self.page, WAIT_TIME)
+                    self.page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+                return self.get_cards(retry=False)
             logger.warning("获取章节卡片失败，按普通章节继续处理: %s", exc)
             return []
 
