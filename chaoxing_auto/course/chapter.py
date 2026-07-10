@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -433,6 +433,147 @@ class ChapterManager:
             logger.warning("获取章节卡片失败，按普通章节继续处理: %s", exc)
             return []
 
+    def _activate_card_by_dom(
+        self,
+        *,
+        title: str,
+        cardid: str,
+        element_id: str,
+        index: str,
+    ) -> Dict[str, Any]:
+        """通过页面 DOM/JS 激活章节卡片，兼容隐藏的 `.tabtags` 页签。"""
+
+        return self.page.evaluate(
+            """
+            ({ title, cardid, elementId, index }) => {
+                const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const candidates = [];
+                const add = (node, source) => {
+                    if (node && !candidates.some(item => item.node === node)) {
+                        candidates.push({ node, source });
+                    }
+                };
+                const isVisible = (node) => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || 1) > 0
+                        && rect.width > 0
+                        && rect.height > 0;
+                };
+                const isActive = (node) => {
+                    const className = ` ${node.className || ''} `;
+                    return /\\s(currents?|active|selected|on)\\s/i.test(className);
+                };
+                const cardNodes = () => Array.from(document.querySelectorAll([
+                    '.tabtags span[cardid]',
+                    '.tabtags span[id^="dct"]',
+                    '.tabtags span[onclick*="changeDisplayContent"]',
+                    'span[cardid][onclick*="changeDisplayContent"]'
+                ].join(',')));
+
+                if (elementId) {
+                    add(document.getElementById(elementId), 'id');
+                }
+                if (cardid) {
+                    cardNodes()
+                        .filter(node => clean(node.getAttribute('cardid') || node.getAttribute('data-cardid') || '') === cardid)
+                        .forEach(node => add(node, 'cardid'));
+                }
+                if (title) {
+                    const wanted = clean(title);
+                    cardNodes()
+                        .filter(node => {
+                            const text = clean(node.getAttribute('title') || node.innerText || node.textContent || '');
+                            return text === wanted || text.includes(wanted) || wanted.includes(text);
+                        })
+                        .forEach(node => add(node, 'title'));
+                }
+                if (index) {
+                    const numericIndex = Number.parseInt(index, 10);
+                    const nodes = cardNodes();
+                    if (Number.isFinite(numericIndex) && numericIndex > 0 && numericIndex <= nodes.length) {
+                        add(nodes[numericIndex - 1], 'index');
+                    }
+                }
+
+                if (!candidates.length) {
+                    return {
+                        ok: false,
+                        reason: 'not_found',
+                        method: '',
+                        visible: 'false',
+                        active: 'false',
+                    };
+                }
+
+                const { node, source } = candidates[0];
+                const visible = isVisible(node);
+                const active = isActive(node);
+
+                try {
+                    if (typeof node.click === 'function') {
+                        node.click();
+                    } else {
+                        node.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                        }));
+                    }
+                    return {
+                        ok: true,
+                        reason: active ? 'active_dom_click' : 'dom_click',
+                        method: source,
+                        visible: String(visible),
+                        active: String(active),
+                    };
+                } catch (clickError) {
+                    const onclick = node.getAttribute('onclick') || '';
+                    if (onclick && typeof node.onclick === 'function') {
+                        try {
+                            node.onclick.call(node, new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                            return {
+                                ok: true,
+                                reason: 'inline_onclick',
+                                method: source,
+                                visible: String(visible),
+                                active: String(active),
+                            };
+                        } catch (inlineError) {
+                            return {
+                                ok: false,
+                                reason: `click_failed: ${clickError.message || clickError}; onclick_failed: ${inlineError.message || inlineError}`,
+                                method: source,
+                                visible: String(visible),
+                                active: String(active),
+                            };
+                        }
+                    }
+                    return {
+                        ok: false,
+                        reason: `click_failed: ${clickError.message || clickError}`,
+                        method: source,
+                        visible: String(visible),
+                        active: String(active),
+                    };
+                }
+            }
+            """,
+            {
+                "title": title,
+                "cardid": cardid,
+                "elementId": element_id,
+                "index": index,
+            },
+        )
+
     def open_card(self, card: Dict[str, str]) -> Dict[str, str]:
         """点击当前章节内的指定卡片。"""
 
@@ -442,29 +583,25 @@ class ChapterManager:
         index = (card.get("index") or "").strip()
 
         try:
-            logger.info("打开章节卡片: %s", title or cardid or index)
-            clicked = False
+            target = title or cardid or element_id or index
+            logger.info("打开章节卡片: %s", target)
+            result = self._activate_card_by_dom(
+                title=title,
+                cardid=cardid,
+                element_id=element_id,
+                index=index,
+            )
+            if not result.get("ok"):
+                raise ChapterError(f"未找到可点击的章节卡片: {target} ({result.get('reason')})")
 
-            if element_id:
-                locator = self.page.locator(f"#{element_id}").first
-                if locator.count() > 0:
-                    locator.click(timeout=WAIT_TIME, force=True)
-                    clicked = True
-
-            if not clicked and cardid:
-                locator = self.page.locator(f'.tabtags span[cardid="{cardid}"], span[cardid="{cardid}"]').first
-                if locator.count() > 0:
-                    locator.click(timeout=WAIT_TIME, force=True)
-                    clicked = True
-
-            if not clicked and title:
-                locator = self.page.locator(".tabtags span").filter(has_text=title).first
-                if locator.count() > 0:
-                    locator.click(timeout=WAIT_TIME, force=True)
-                    clicked = True
-
-            if not clicked:
-                raise ChapterError(f"未找到可点击的章节卡片: {title or cardid or index}")
+            logger.info(
+                "章节卡片已激活: %s method=%s reason=%s visible=%s active=%s",
+                target,
+                result.get("method") or "unknown",
+                result.get("reason") or "unknown",
+                result.get("visible") or "unknown",
+                result.get("active") or "unknown",
+            )
 
             # 卡片切换多数是页面内 JS 动态加载，不一定触发导航；这里给 DOM/iframe 一点刷新时间。
             self.page.wait_for_timeout(1200)

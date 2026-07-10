@@ -746,16 +746,31 @@ class ChaoxingAutomationEngine:
 
         task_status = video_player.get_video_task_status(timeout=8000)
         task_point_status = str(task_status.get("status") or "unknown")
-        if task_point_status != "unfinished":
-            if task_point_status == "completed":
-                message = f"视频任务点已完成，跳过播放: {unit_title}"
-            else:
-                message = f"未检测到明确“任务点未完成”状态，跳过播放: {unit_title}"
-            self._notify_status(
-                message=message,
+        if task_point_status == "completed":
+            message = f"视频任务点已完成，跳过播放: {unit_title}"
+            self._notify_status(message=message)
+            logger.info(
+                "%s source=%s text=%s",
+                message,
+                task_status.get("source") or "unknown",
+                task_status.get("text") or "",
             )
-            logger.info(message)
             return True
+
+        if task_point_status == "unfinished":
+            logger.info(
+                "检测到视频任务点未完成，开始播放: %s source=%s",
+                unit_title,
+                task_status.get("source") or "unknown",
+            )
+        else:
+            # 学习通的视频状态经常在主页面 iframe 外部，或在动态加载后才出现。
+            # 只要检测到了 video，就不要因为状态 unknown 直接跳过；只有明确“已完成”才跳过。
+            logger.info(
+                "未检测到明确已完成状态，按未完成处理并尝试播放: %s source=%s",
+                unit_title,
+                task_status.get("source") or "unknown",
+            )
 
         unit_total = max(1, unit_total)
         unit_index = max(1, unit_index)

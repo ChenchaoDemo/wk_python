@@ -124,6 +124,43 @@ class VideoPlayer:
             self._wait_for_video_frame(max_wait=timeout)
             return True
         except VideoNotFoundError:
+            return self._has_video_iframe_on_page()
+
+    def _has_video_iframe_on_page(self) -> bool:
+        """检测主页面是否已出现学习通视频 iframe/容器。
+
+        有些页面 iframe 先出现，内部 video 稍后才加载；此时不能直接按“无视频”跳过。
+        """
+
+        try:
+            return bool(
+                self.page.evaluate(
+                    """
+                    () => {
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && Number(style.opacity || 1) > 0
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const nodes = Array.from(document.querySelectorAll([
+                            '.ans-attach-ct.videoContainer iframe',
+                            '.videoContainer iframe',
+                            'iframe.ans-insertvideo-online',
+                            'iframe[src*="/ananas/modules/video"]',
+                            'iframe[objectid][jobid]'
+                        ].join(',')));
+                        return nodes.some(node => isVisible(node) || isVisible(node.closest('.videoContainer,.ans-attach-ct')));
+                    }
+                    """
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("检测主页面视频 iframe 失败: %s", exc)
             return False
 
     def get_video_task_status(self, timeout: Optional[int] = None) -> Dict[str, str]:
@@ -134,15 +171,17 @@ class VideoPlayer:
         任务点状态元素。只要明确看到“任务点已完成”，当前视频就可以跳过。
         """
 
-        frame = self._wait_for_video_frame(max_wait=timeout)
-
-        frame_status = self._detect_task_status_in_frame(frame)
-        if frame_status.get("status") != "unknown":
-            return frame_status
-
         page_status = self._detect_task_status_on_page()
         if page_status.get("status") != "unknown":
             return page_status
+
+        try:
+            frame = self._wait_for_video_frame(max_wait=timeout)
+            frame_status = self._detect_task_status_in_frame(frame)
+            if frame_status.get("status") != "unknown":
+                return frame_status
+        except VideoNotFoundError:
+            logger.debug("检测视频任务点状态时尚未找到 iframe 内部 video，按 unknown 返回并交给播放流程继续等待")
 
         return {
             "status": "unknown",
@@ -336,6 +375,83 @@ class VideoPlayer:
                         el.outerHTML || '',
                     ].join(' '));
 
+                    const collectPreferredStatus = (statuses) => {
+                        const unfinished = statuses.find(item => item.status === 'unfinished');
+                        if (unfinished) return unfinished;
+                        const completed = statuses.find(item => item.status === 'completed');
+                        if (completed) return completed;
+                        return { status: 'unknown', completed: 'false', source: 'page_unknown', text: '' };
+                    };
+
+                    const statusFromVideoContainer = (container) => {
+                        const status = normalizeStatus(infoOf(container), 'page_video_container');
+                        if (status.status !== 'unknown') return status;
+
+                        const className = ` ${container.className || ''} `;
+                        if (/(^|\\s)(ans-job-finished|job-finished)(\\s|$)/i.test(className)) {
+                            return {
+                                status: 'completed',
+                                completed: 'true',
+                                source: 'page_video_container_class',
+                                text: infoOf(container),
+                            };
+                        }
+
+                        const icon = container.querySelector('.ans-job-icon[aria-label*="任务点"], [aria-label*="任务点"]');
+                        const iconLabel = icon ? clean(icon.getAttribute('aria-label') || icon.getAttribute('title') || '') : '';
+                        if (/任务点已完成/.test(iconLabel)) {
+                            return {
+                                status: 'completed',
+                                completed: 'true',
+                                source: 'page_video_container_icon',
+                                text: iconLabel,
+                            };
+                        }
+                        if (/任务点未完成/.test(iconLabel)) {
+                            return {
+                                status: 'unfinished',
+                                completed: 'false',
+                                source: 'page_video_container_icon',
+                                text: iconLabel,
+                            };
+                        }
+
+                        // 学习通当前结构里，视频任务容器有 ans-job-icon 但没有 ans-job-finished 时，
+                        // 通常就是“任务点未完成”。这可以覆盖用户提供的未完成页面结构。
+                        if (container.querySelector('.ans-job-icon') && !/(^|\\s)ans-job-finished(\\s|$)/i.test(className)) {
+                            return {
+                                status: 'unfinished',
+                                completed: 'false',
+                                source: 'page_video_container_no_finished_marker',
+                                text: infoOf(container),
+                            };
+                        }
+
+                        return status;
+                    };
+
+                    const videoContainers = Array.from(document.querySelectorAll([
+                        '.ans-attach-ct.videoContainer',
+                        '.videoContainer',
+                        '.ans-attach-ct'
+                    ].join(','))).filter(container => {
+                        const hasVideoEntry = container.querySelector([
+                            'iframe.ans-insertvideo-online',
+                            'iframe[src*="/ananas/modules/video"]',
+                            'iframe[objectid][jobid]',
+                            'video'
+                        ].join(','));
+                        return hasVideoEntry
+                            && (isVisible(container) || isVisible(hasVideoEntry));
+                    });
+                    const containerStatuses = [];
+                    for (const container of videoContainers) {
+                        const status = statusFromVideoContainer(container);
+                        if (status.status !== 'unknown') containerStatuses.push(status);
+                    }
+                    const preferredContainerStatus = collectPreferredStatus(containerStatuses);
+                    if (preferredContainerStatus.status !== 'unknown') return preferredContainerStatus;
+
                     const selectors = [
                         '.ans-job-finished',
                         '.ans-job-unfinished',
@@ -347,10 +463,13 @@ class VideoPlayer:
                         '[aria-label*="任务点"]'
                     ].join(',');
                     const nodes = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
+                    const explicitStatuses = [];
                     for (const node of nodes) {
                         const status = normalizeStatus(infoOf(node), 'page_explicit_node');
-                        if (status.status !== 'unknown') return status;
+                        if (status.status !== 'unknown') explicitStatuses.push(status);
                     }
+                    const preferredExplicitStatus = collectPreferredStatus(explicitStatuses);
+                    if (preferredExplicitStatus.status !== 'unknown') return preferredExplicitStatus;
 
                     const active = document.querySelector('.tabtags span.currents, .tabtags span.current, .tabtags span.active');
                     if (active) {
