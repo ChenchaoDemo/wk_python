@@ -54,6 +54,21 @@ VIDEO_COMPLETE_RATE: float = float(os.getenv("CHAOXING_VIDEO_COMPLETE_RATE", "0.
 AUTH_FILE: Path = BASE_DIR / "auth.json"
 LOG_DIR: Path = BASE_DIR / "logs"
 SCREENSHOT_DIR: Path = BASE_DIR / "screenshots"
+QUESTION_BANK_DB: Path = Path(
+    os.getenv("CHAOXING_QUESTION_BANK_DB", str(BASE_DIR / "config" / "question_bank.sqlite3"))
+)
+
+# =========================
+# DeepSeek 答题配置
+# =========================
+# API Key 不写死在源码里：优先读取环境变量，也支持 config/deepseek.local.json。
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", os.getenv("CHAOXING_DEEPSEEK_API_KEY", "")).strip()
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions").strip()
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
+DEEPSEEK_TIMEOUT: int = int(os.getenv("DEEPSEEK_TIMEOUT", "45"))
+DEEPSEEK_MAX_WORKERS: int = int(os.getenv("DEEPSEEK_MAX_WORKERS", "4"))
+DEEPSEEK_LOCAL_MATCH_THRESHOLD: float = float(os.getenv("DEEPSEEK_LOCAL_MATCH_THRESHOLD", "0.82"))
+DEEPSEEK_MIN_CONFIDENCE: float = float(os.getenv("DEEPSEEK_MIN_CONFIDENCE", "0.35"))
 
 # =========================
 # 调试配置

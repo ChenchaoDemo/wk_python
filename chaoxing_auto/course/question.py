@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from playwright.sync_api import Page, Response
 
 from config.config import LOG_DIR
+from course.answer_bank import AnswerBank
 from utils.helper import sanitize_filename
 from utils.logger import get_logger
 
@@ -333,6 +334,8 @@ class QuestionManager:
         self.page = page
         self.last_question_snapshot: Dict[str, Any] = {}
         self.last_question_snapshot_time = 0.0
+        self.answer_bank = AnswerBank()
+        self._sqlite_seeded = False
 
     @staticmethod
     def is_question_like_title(text: str) -> bool:
@@ -926,6 +929,18 @@ class QuestionManager:
                 return entry
         return None
 
+    def _ensure_sqlite_seeded(self) -> None:
+        """把旧内置/JSON 题库导入 SQLite；重复导入会走 upsert。"""
+
+        if self._sqlite_seeded:
+            return
+        try:
+            if self.answer_bank.count_by_source("legacy_bank") == 0:
+                self.answer_bank.import_entries(self._load_question_bank(), source="legacy_bank")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("导入旧题库到 SQLite 失败，将继续使用旧题库兜底: %s", exc)
+        self._sqlite_seeded = True
+
     @classmethod
     def _match_answer_option(cls, answer_text: str, options: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         answer_text = str(answer_text or "").strip()
@@ -957,31 +972,33 @@ class QuestionManager:
                 best_option = option
         return best_option if best_score >= 50 else None
 
-    @classmethod
-    def _build_answer_plan(cls, questions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        plan: List[Dict[str, Any]] = []
+    def _build_answer_plan(self, questions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        self._ensure_sqlite_seeded()
+        plan_by_index: Dict[int, Dict[str, Any]] = {}
         missing: List[Dict[str, Any]] = []
-        for question in questions:
+        pending_deepseek: List[Dict[str, Any]] = []
+
+        def coerce_answers(raw_answers: Any) -> List[str]:
+            if isinstance(raw_answers, str):
+                return [raw_answers]
+            if isinstance(raw_answers, list):
+                return [str(answer) for answer in raw_answers if str(answer).strip()]
+            return []
+
+        def apply_answers(
+            index: int,
+            question: Dict[str, Any],
+            answers: List[str],
+            *,
+            source: str,
+        ) -> tuple[bool, str, List[Dict[str, Any]]]:
             options = list(question.get("options") or [])
             question_id = str(question.get("id") or "")
             stem = str(question.get("stem") or question.get("text") or "")
-            if not options or not question_id:
-                missing.append({"id": question_id, "stem": stem[:120], "reason": "缺少题目 id 或选项"})
-                continue
-
-            bank_entry = cls._find_bank_entry(stem, question_id=question_id)
-            if not bank_entry:
-                missing.append({"id": question_id, "stem": stem[:120], "reason": "题库未命中"})
-                continue
-
-            answers = bank_entry.get("answers") or bank_entry.get("answer") or []
-            if isinstance(answers, str):
-                answers = [answers]
-
             selected_options: List[Dict[str, Any]] = []
             failed_answers: List[str] = []
             for answer in answers:
-                option = cls._match_answer_option(str(answer), options)
+                option = self._match_answer_option(str(answer), options)
                 if not option:
                     failed_answers.append(str(answer))
                     continue
@@ -989,30 +1006,103 @@ class QuestionManager:
                     selected_options.append(option)
 
             if failed_answers or not selected_options:
-                missing.append(
-                    {
-                        "id": question_id,
-                        "stem": stem[:120],
-                        "reason": f"答案未匹配到选项: {failed_answers}",
-                    }
-                )
+                return False, f"答案未匹配到选项: {failed_answers}", []
+
+            answer_items = [
+                {
+                    "letter": option.get("letter"),
+                    "text": option.get("text"),
+                    "value": option.get("value"),
+                }
+                for option in selected_options
+            ]
+            plan_by_index[index] = {
+                "id": question_id,
+                "type": question.get("type") or "unknown",
+                "stem": stem[:160],
+                "source": source,
+                "answers": answer_items,
+            }
+            return True, "", selected_options
+
+        for index, question in enumerate(questions):
+            options = list(question.get("options") or [])
+            question_id = str(question.get("id") or "")
+            stem = str(question.get("stem") or question.get("text") or "")
+            if not options or not question_id:
+                missing.append({"id": question_id, "stem": stem[:120], "reason": "缺少题目 id 或选项"})
                 continue
 
-            plan.append(
+            sqlite_entry = self.answer_bank.lookup(question)
+            if sqlite_entry:
+                ok, reason, _ = apply_answers(
+                    index,
+                    question,
+                    coerce_answers(sqlite_entry.get("answers") or []),
+                    source=str(sqlite_entry.get("source") or "sqlite"),
+                )
+                if ok:
+                    continue
+                logger.warning("SQLite 题库命中但答案无法匹配当前选项，改用后续兜底: qid=%s reason=%s", question_id, reason)
+
+            bank_entry = self._find_bank_entry(stem, question_id=question_id)
+            if bank_entry:
+                ok, reason, selected_options = apply_answers(
+                    index,
+                    question,
+                    coerce_answers(bank_entry.get("answers") or bank_entry.get("answer") or []),
+                    source="legacy_bank",
+                )
+                if ok:
+                    try:
+                        self.answer_bank.save_answer(
+                            question,
+                            [str(option.get("text") or "") for option in selected_options],
+                            source="legacy_bank",
+                            confidence=1.0,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("旧题库命中结果写入 SQLite 失败: %s", exc)
+                    continue
+                logger.warning("旧题库命中但答案无法匹配当前选项，改用 DeepSeek: qid=%s reason=%s", question_id, reason)
+
+            pending_deepseek.append(
                 {
-                    "id": question_id,
-                    "type": question.get("type") or "unknown",
-                    "stem": stem[:160],
-                    "answers": [
-                        {
-                            "letter": option.get("letter"),
-                            "text": option.get("text"),
-                            "value": option.get("value"),
-                        }
-                        for option in selected_options
-                    ],
+                    "index": index,
+                    "question": question,
+                    "reason": "本地题库未命中或答案无法匹配当前选项",
                 }
             )
+
+        if pending_deepseek:
+            deepseek_questions = [item["question"] for item in pending_deepseek]
+            deepseek_results = self.answer_bank.query_deepseek_parallel(deepseek_questions)
+            for item in pending_deepseek:
+                index = int(item["index"])
+                question = item["question"]
+                question_id = str(question.get("id") or "")
+                key = question_id or str(question.get("index") or "")
+                result = deepseek_results.get(key)
+                if result and result.get("answers"):
+                    ok, reason, _ = apply_answers(
+                        index,
+                        question,
+                        coerce_answers(result.get("answers") or []),
+                        source=str(result.get("source") or "deepseek"),
+                    )
+                    if ok:
+                        continue
+                    missing.append({"id": question_id, "stem": str(question.get("stem") or "")[:120], "reason": reason})
+                else:
+                    missing.append(
+                        {
+                            "id": question_id,
+                            "stem": str(question.get("stem") or "")[:120],
+                            "reason": "DeepSeek 未返回可用答案",
+                        }
+                    )
+
+        plan = [plan_by_index[index] for index in sorted(plan_by_index)]
         return {"plan": plan, "missing": missing}
 
     def _apply_answer_plan(self, answer_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
