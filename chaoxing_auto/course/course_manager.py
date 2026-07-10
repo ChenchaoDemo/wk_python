@@ -280,18 +280,6 @@ class CourseManager:
             )
             cleaned = self._merge_course_items(courses)
             logger.info("获取课程数量: %s", len(cleaned))
-            for course in cleaned:
-                logger.info(
-                    "课程: %s | courseId=%s 开始=%s 截止=%s 考试=%s 考试开始=%s 任务=%s -> %s",
-                    course.get("name"),
-                    course.get("course_id") or "未显示",
-                    course.get("start_time") or "未显示",
-                    course.get("end_time") or "未显示",
-                    course.get("exam_status") or course.get("has_exam") or "未显示",
-                    course.get("exam_start_time") or "未显示",
-                    course.get("task_progress") or "未显示",
-                    course.get("url"),
-                )
             return cleaned
         except PlaywrightTimeoutError as exc:
             save_screenshot(self.page, "error_get_courses_timeout")

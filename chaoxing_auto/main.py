@@ -44,6 +44,8 @@ class ChaoxingAutomationEngine:
         password: str = PASSWORD,
         allow_manual_verify: bool = False,
         status_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        browser_profile_dir: Optional[Path] = None,
+        storage_state_path: Optional[Path] = None,
     ) -> None:
         self.course_name = course_name
         self.headless = headless
@@ -52,6 +54,8 @@ class ChaoxingAutomationEngine:
         self.password = password
         self.allow_manual_verify = allow_manual_verify
         self.status_callback = status_callback
+        self.browser_profile_dir = Path(browser_profile_dir) if browser_profile_dir is not None else None
+        self.storage_state_path = Path(storage_state_path) if storage_state_path is not None else None
         self.status = TaskStatus(course_name=course_name, status="idle")
         self.browser_manager: Optional[BrowserManager] = None
         self._stop_requested = False
@@ -105,9 +109,17 @@ class ChaoxingAutomationEngine:
         """确保浏览器、上下文和页面已经创建。"""
 
         if self.browser_manager is None:
-            self.browser_manager = BrowserManager(headless=self.headless)
+            manager_kwargs: Dict[str, Any] = {"headless": self.headless}
+            if self.browser_profile_dir is not None:
+                manager_kwargs["user_data_dir"] = self.browser_profile_dir
+            if self.storage_state_path is not None:
+                manager_kwargs["storage_state_path"] = self.storage_state_path
+            self.browser_manager = BrowserManager(**manager_kwargs)
 
-        if self.browser_manager.browser is None or not self.browser_manager.browser.is_connected():
+        if (
+            self.browser_manager.context is None
+            and (self.browser_manager.browser is None or not self.browser_manager.browser.is_connected())
+        ):
             self._notify_status(status="running", message="正在启动浏览器...")
             self.browser_manager.context = None
             self.browser_manager.page = None

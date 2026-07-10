@@ -138,6 +138,9 @@ class LoginManager:
                 self._notify("检测到疑似验证组件，先继续尝试账号密码登录。")
 
             if not self.username or not self.password:
+                if self.allow_manual_verify:
+                    self._notify("未提供完整账号密码，请在打开的浏览器窗口中手动完成首次登录。")
+                    return self._wait_manual_login(page)
                 raise LoginError("用户名或密码为空，请在 config/config.py 或环境变量中配置")
 
             username_input = wait_visible_any_selector(page, self.username_selectors, timeout=SHORT_WAIT_TIME)

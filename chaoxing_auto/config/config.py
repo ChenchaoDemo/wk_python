@@ -52,6 +52,8 @@ VIDEO_COMPLETE_RATE: float = float(os.getenv("CHAOXING_VIDEO_COMPLETE_RATE", "0.
 # 文件路径
 # =========================
 AUTH_FILE: Path = BASE_DIR / "auth.json"
+ACCOUNT_STATE_FILE: Path = BASE_DIR / "config" / "accounts.local.json"
+PROFILE_DIR: Path = BASE_DIR / "profiles"
 LOG_DIR: Path = BASE_DIR / "logs"
 SCREENSHOT_DIR: Path = BASE_DIR / "screenshots"
 QUESTION_BANK_DB: Path = Path(

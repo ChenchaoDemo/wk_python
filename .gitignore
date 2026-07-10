@@ -1,6 +1,8 @@
 chaoxing_auto/config/gui_state.json
+chaoxing_auto/config/accounts.local.json
 chaoxing_auto/config/deepseek.local.json
 chaoxing_auto/config/question_bank.sqlite3*
+chaoxing_auto/profiles/
 
 # 运行过程中产生的日志和截图不提交
 chaoxing_auto/logs/
