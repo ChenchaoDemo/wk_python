@@ -20,6 +20,7 @@ from config.config import COURSE_NAME, DEBUG_MODE, HEADLESS, PASSWORD, PAUSE_ON_
 from course.chapter import ChapterManager
 from course.course_manager import CourseManager
 from course.question import QuestionManager
+from course.task_query import CourseTaskQueryManager
 from login.login import LoginManager
 from utils.helper import TaskStatus, debug_pause, save_screenshot
 from utils.logger import get_logger
@@ -60,6 +61,7 @@ class ChaoxingAutomationEngine:
         self.browser_manager: Optional[BrowserManager] = None
         self._stop_requested = False
         self.courses: List[Dict[str, str]] = []
+        self.query_results: List[Dict[str, str]] = []
         self.current_course: Optional[Dict[str, str]] = None
         self._resume_chapter_index = 0
         self._resume_card_index = 0
@@ -262,6 +264,74 @@ class ChaoxingAutomationEngine:
                 save_screenshot(page, "error_login_courses")
             self._notify_status(status="failed", message=str(exc))
             logger.exception("登录并获取课程失败: %s", exc)
+            raise
+
+    def login_and_query_items(
+        self,
+        query_type: str,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """登录后查询待考试、待做作业或按课程展示的全部作业。"""
+
+        normalized_type = str(query_type or "").strip().lower()
+        query_labels = {
+            "pending_exams": "待考试列表",
+            "pending_homeworks": "待做作业列表",
+            "homeworks_by_course": "按课程展示的全部作业",
+        }
+        if normalized_type not in query_labels:
+            raise ValueError(f"不支持的查询类型: {query_type}")
+
+        page: Optional[Page] = None
+        label = query_labels[normalized_type]
+        self.query_results = []
+        self.course_name = ""
+        self.status.course_name = ""
+        self.status.chapter_name = ""
+        try:
+            courses = self.login_and_get_courses(username=username, password=password)
+            page = self._ensure_page()
+            self._notify_status(
+                status="running",
+                progress=0.0,
+                course_name="",
+                chapter_name="",
+                message=f"登录成功，正在查询{label}...",
+            )
+
+            query_manager = CourseTaskQueryManager(
+                page,
+                status_callback=lambda message: self._notify_status(status="running", message=message),
+                should_stop=lambda: self._stop_requested,
+            )
+            if normalized_type == "pending_exams":
+                results = query_manager.get_pending_exams(courses)
+            elif normalized_type == "pending_homeworks":
+                results = query_manager.get_pending_homeworks(courses)
+            else:
+                results = query_manager.get_homeworks_by_course(courses)
+
+            self.query_results = results
+            if self._stop_requested:
+                self._notify_status(
+                    status="stopped",
+                    progress=0.0,
+                    message=f"已停止查询{label}，当前已读取 {len(results)} 条",
+                )
+            else:
+                message = (
+                    f"{label}查询完成，共 {len(results)} 条"
+                    if results
+                    else f"{label}查询完成，未找到符合条件的记录"
+                )
+                self._notify_status(status="results_loaded", progress=100.0, message=message)
+            return results
+        except Exception as exc:
+            if page is not None:
+                save_screenshot(page, f"error_query_{normalized_type}")
+            self._notify_status(status="failed", message=str(exc))
+            logger.exception("查询%s失败: %s", label, exc)
             raise
 
     def start_selected_course(self, course: Dict[str, str]) -> Dict[str, Any]:

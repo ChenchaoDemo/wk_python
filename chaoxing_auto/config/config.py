@@ -38,6 +38,18 @@ VIEWPORT_HEIGHT: int = int(os.getenv("CHAOXING_VIEWPORT_HEIGHT", "900"))
 BROWSER_CHANNEL: str = os.getenv("CHAOXING_BROWSER_CHANNEL", "chrome").strip()
 # 默认不伪造 UA，直接使用真实浏览器 UA；如确实需要可通过环境变量覆盖。
 BROWSER_USER_AGENT: str = os.getenv("CHAOXING_BROWSER_USER_AGENT", "").strip()
+# 拦截学习通二维码状态轮询接口，直接返回成功，避免页面长时间等待。
+QR_STATUS_INTERCEPT_ENABLED: bool = os.getenv("CHAOXING_QR_STATUS_INTERCEPT", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
+QR_STATUS_FIRST_BODY: str = os.getenv("CHAOXING_QR_STATUS_FIRST_BODY", '{"status":1}')
+QR_STATUS_SUCCESS_BODY: str = os.getenv(
+    "CHAOXING_QR_STATUS_SUCCESS_BODY",
+    '{"status":2,"compareResult":"0"}',
+)
 
 # =========================
 # 等待与轮询配置，单位：毫秒

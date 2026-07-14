@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError
 from playwright.sync_api import Page, Playwright, sync_playwright
@@ -13,6 +14,9 @@ from config.config import (
     BROWSER_CHANNEL,
     BROWSER_USER_AGENT,
     HEADLESS,
+    QR_STATUS_FIRST_BODY,
+    QR_STATUS_INTERCEPT_ENABLED,
+    QR_STATUS_SUCCESS_BODY,
     SLOW_MO,
     WAIT_TIME,
     VIEWPORT_HEIGHT,
@@ -47,6 +51,7 @@ class BrowserManager:
         self.page: Optional[Page] = None
         self._cdp_sessions: list[Any] = []
         self._debugger_disabled_page_ids: set[int] = set()
+        self._qr_status_request_counts: dict[str, int] = {}
 
     def _launch_kwargs(self) -> dict[str, Any]:
         launch_kwargs: dict[str, Any] = {
@@ -166,6 +171,9 @@ class BrowserManager:
 
         context.set_default_timeout(WAIT_TIME)
         context.set_default_navigation_timeout(WAIT_TIME)
+        if QR_STATUS_INTERCEPT_ENABLED:
+            context.route("**/mooc-ans/qr/getqrstatus**", self._handle_qr_status_route)
+            logger.info("已启用二维码状态接口拦截: /mooc-ans/qr/getqrstatus")
         context.on("page", self._disable_debugger_pause)
         context.add_init_script(
             """
@@ -220,6 +228,42 @@ class BrowserManager:
         )
         for page in context.pages:
             self._disable_debugger_pause(page)
+
+    def _handle_qr_status_route(self, route: Any) -> None:
+        """拦截二维码状态轮询接口，直接返回成功响应。"""
+
+        request = route.request
+        url = request.url or ""
+        try:
+            parsed = urlsplit(url)
+            if "/mooc-ans/qr/getqrstatus" not in parsed.path:
+                route.continue_()
+                return
+
+            query = parse_qs(parsed.query)
+            qr_key = query.get("uuid", [url])[0] or url
+            request_count = self._qr_status_request_counts.get(qr_key, 0) + 1
+            self._qr_status_request_counts[qr_key] = request_count
+            body = QR_STATUS_FIRST_BODY if request_count == 1 else QR_STATUS_SUCCESS_BODY
+
+            origin = request.headers.get("origin")
+            headers = {
+                "content-type": "text/html;charset=UTF-8",
+                "cache-control": "no-store, no-cache, must-revalidate",
+                "pragma": "no-cache",
+            }
+            if origin:
+                headers["access-control-allow-origin"] = origin
+                headers["access-control-allow-credentials"] = "true"
+
+            route.fulfill(status=200, headers=headers, body=body)
+            logger.info("已拦截二维码状态接口并返回第 %s 次响应: %s body=%s", request_count, url, body)
+        except Exception as exc:  # noqa: BLE001 - 拦截失败时放行请求，避免影响其它流程
+            logger.warning("二维码状态接口拦截失败，改为放行: %s", exc)
+            try:
+                route.continue_()
+            except Exception as continue_exc:  # noqa: BLE001
+                logger.debug("二维码状态接口放行失败: %s", continue_exc)
 
     def new_page(self) -> Page:
         """??????"""

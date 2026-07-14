@@ -7,6 +7,7 @@
     - 多账号管理；
     - 每个账号独立 Chrome Profile 和登录状态；
     - 单个账号可多选课程加入队列；
+    - 支持查询待考试、待做作业和按课程展示全部作业；
     - 不同账号并行运行，同一账号内课程按队列顺序执行。
 """
 
@@ -35,6 +36,16 @@ from config.config import ACCOUNT_STATE_FILE, PASSWORD, PROFILE_DIR, USERNAME
 from main import ChaoxingAutomationEngine
 
 
+TASK_TYPE_OPTIONS = (
+    ("刷课（选择课程）", "courses"),
+    ("查询考试列表（待考试）", "pending_exams"),
+    ("查询作业列表（待做）", "pending_homeworks"),
+    ("查询全部作业（按课程展示）", "homeworks_by_course"),
+)
+TASK_TYPE_LABEL_TO_VALUE = dict(TASK_TYPE_OPTIONS)
+TASK_TYPE_VALUE_TO_LABEL = {value: label for label, value in TASK_TYPE_OPTIONS}
+
+
 @dataclass
 class AccountRuntime:
     """GUI 内部账号运行态。"""
@@ -47,6 +58,7 @@ class AccountRuntime:
     password: str = ""
     headless: bool = False
     allow_manual_verify: bool = True
+    query_type: str = "courses"
     courses: List[Dict[str, str]] = field(default_factory=list)
     command_queue: "queue.Queue[tuple[str, Any]]" = field(default_factory=queue.Queue)
     thread: Optional[threading.Thread] = None
@@ -71,9 +83,10 @@ class ChaoxingGUI(tk.Tk):
 
         self.username_var = tk.StringVar(value=USERNAME)
         self.password_var = tk.StringVar(value=PASSWORD)
+        self.task_type_var = tk.StringVar(value=TASK_TYPE_VALUE_TO_LABEL["courses"])
         self.visible_browser_var = tk.BooleanVar(value=True)
         self.manual_verify_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="新增账号后获取课程；首次登录可勾选手动登录。")
+        self.status_var = tk.StringVar(value="输入账号密码并选择类型后执行；首次登录可勾选手动登录。")
 
         self.events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self.accounts: Dict[str, AccountRuntime] = {}
@@ -105,6 +118,8 @@ class ChaoxingGUI(tk.Tk):
                 continue
             display_name = username
             runtime = self._create_runtime(account_id, username, display_name)
+            runtime.password = str(item.get("password") or "")
+            runtime.query_type = self._normalize_task_type(str(item.get("query_type") or "courses"))
             self.accounts[account_id] = runtime
             self._upsert_account_row(runtime)
 
@@ -121,6 +136,8 @@ class ChaoxingGUI(tk.Tk):
                             {
                                 "account_id": runtime.account_id,
                                 "username": runtime.username,
+                                "password": runtime.password,
+                                "query_type": runtime.query_type,
                                 "display_name": runtime.display_name,
                                 "profile_dir": str(runtime.profile_dir),
                             }
@@ -165,7 +182,21 @@ class ChaoxingGUI(tk.Tk):
         ttk.Entry(account_frame, textvariable=self.username_var).grid(row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=4)
         ttk.Label(account_frame, text="密码:").grid(row=0, column=2, sticky=tk.W, padx=(0, 6), pady=4)
         ttk.Entry(account_frame, textvariable=self.password_var).grid(row=0, column=3, sticky=tk.EW, padx=(0, 12), pady=4)
-        ttk.Button(account_frame, text="新增/登录并获取课程", command=self._login_or_add_account).grid(row=0, column=4, sticky=tk.EW, pady=4)
+        ttk.Label(account_frame, text="类型:").grid(row=0, column=4, sticky=tk.W, padx=(0, 6), pady=4)
+        self.task_type_combo = ttk.Combobox(
+            account_frame,
+            textvariable=self.task_type_var,
+            values=[label for label, _value in TASK_TYPE_OPTIONS],
+            width=26,
+            state="readonly",
+        )
+        self.task_type_combo.grid(row=0, column=5, sticky=tk.EW, padx=(0, 12), pady=4)
+        ttk.Button(account_frame, text="新增/登录并执行", command=self._login_or_add_account).grid(
+            row=0,
+            column=6,
+            sticky=tk.EW,
+            pady=4,
+        )
 
         ttk.Checkbutton(account_frame, text="显示浏览器窗口", variable=self.visible_browser_var).grid(row=1, column=1, sticky=tk.W, pady=4)
         ttk.Checkbutton(
@@ -173,7 +204,12 @@ class ChaoxingGUI(tk.Tk):
             text="首次/验证码时允许我在浏览器中手动登录",
             variable=self.manual_verify_var,
         ).grid(row=1, column=3, sticky=tk.W, pady=4)
-        ttk.Button(account_frame, text="刷新选中账号课程", command=self._refresh_selected_account).grid(row=1, column=4, sticky=tk.EW, pady=4)
+        ttk.Button(account_frame, text="刷新/执行选中类型", command=self._refresh_selected_account).grid(
+            row=1,
+            column=6,
+            sticky=tk.EW,
+            pady=4,
+        )
 
         body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -220,6 +256,7 @@ class ChaoxingGUI(tk.Tk):
 
     def _build_course_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="选中账号的课程列表（支持 Ctrl/Shift 多选）", padding=8)
+        self.course_frame = frame
         frame.grid(row=0, column=0, sticky=tk.NSEW)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
@@ -249,8 +286,10 @@ class ChaoxingGUI(tk.Tk):
 
         actions = ttk.Frame(frame)
         actions.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-        ttk.Button(actions, text="加入选中课程到刷课列表", command=self._enqueue_selected_courses).pack(side=tk.LEFT)
-        ttk.Button(actions, text="全选课程", command=self._select_all_courses).pack(side=tk.LEFT, padx=(8, 0))
+        self.enqueue_courses_button = ttk.Button(actions, text="加入选中课程到刷课列表", command=self._enqueue_selected_courses)
+        self.enqueue_courses_button.pack(side=tk.LEFT)
+        self.select_all_courses_button = ttk.Button(actions, text="全选课程", command=self._select_all_courses)
+        self.select_all_courses_button.pack(side=tk.LEFT, padx=(8, 0))
 
     def _build_task_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="刷课列表 / 运行状态", padding=8)
@@ -287,6 +326,7 @@ class ChaoxingGUI(tk.Tk):
     def _login_or_add_account(self) -> None:
         username = self.username_var.get().strip()
         password = self.password_var.get()
+        query_type = self._selected_task_type()
         display_name = username
         if not username:
             messagebox.showwarning("缺少账号", "请输入账号；如果只想手动登录，也需要填一个账号标识用于管理 Profile。")
@@ -302,27 +342,43 @@ class ChaoxingGUI(tk.Tk):
             self.accounts[account_id] = runtime
         runtime.username = username
         runtime.display_name = display_name
-        runtime.password = password
+        if password or not runtime.password:
+            runtime.password = password
         runtime.headless = not self.visible_browser_var.get()
         runtime.allow_manual_verify = self.manual_verify_var.get()
+        if runtime.query_type != query_type:
+            runtime.courses = []
+        runtime.query_type = query_type
         self._upsert_account_row(runtime)
         self._save_accounts()
         self._ensure_account_thread(runtime)
-        runtime.command_queue.put(("login", None))
+        runtime.command_queue.put(("login", {"query_type": query_type}))
         self._select_account(account_id)
-        self._append_log(f"[{runtime.display_name}] 已提交登录/获取课程请求")
+        self._append_log(f"[{runtime.display_name}] 已提交登录/执行请求：{self._task_type_label(query_type)}")
 
     def _refresh_selected_account(self) -> None:
         runtime = self._selected_runtime()
         if runtime is None:
             return
+        current_password = self.password_var.get()
+        if current_password or not runtime.password:
+            runtime.password = current_password
+        selected_type = self._selected_task_type()
+        if runtime.query_type != selected_type:
+            runtime.courses = []
+        runtime.query_type = selected_type
+        self._load_courses_for_account(runtime)
+        self._save_accounts()
         self._ensure_account_thread(runtime)
-        runtime.command_queue.put(("login", None))
-        self._append_log(f"[{runtime.display_name}] 已提交刷新课程请求")
+        runtime.command_queue.put(("login", {"query_type": runtime.query_type}))
+        self._append_log(f"[{runtime.display_name}] 已提交刷新请求：{self._task_type_label(runtime.query_type)}")
 
     def _enqueue_selected_courses(self) -> None:
         runtime = self._selected_runtime()
         if runtime is None:
+            return
+        if runtime.query_type != "courses":
+            messagebox.showwarning("当前不是课程列表", "请先在类型中选择“刷课（选择课程）”，登录获取课程后再加入刷课列表。")
             return
         selection = self.course_tree.selection()
         if not selection:
@@ -411,7 +467,8 @@ class ChaoxingGUI(tk.Tk):
             command, payload = runtime.command_queue.get()
             try:
                 if command == "login":
-                    self._worker_login(runtime)
+                    payload = payload or {}
+                    self._worker_login(runtime, str(payload.get("query_type") or runtime.query_type))
                 elif command == "add_courses":
                     payload = payload or {}
                     self._worker_run_courses(runtime, list(payload.get("courses") or []), list(payload.get("task_ids") or []))
@@ -429,10 +486,14 @@ class ChaoxingGUI(tk.Tk):
             runtime.status = "已关闭"
             self.events.put(("account_state", {"account_id": runtime.account_id}))
 
-    def _worker_login(self, runtime: AccountRuntime) -> None:
+    def _worker_login(self, runtime: AccountRuntime, query_type: str = "courses") -> None:
+        query_type = self._normalize_task_type(query_type)
+        runtime.query_type = query_type
+        query_label = self._task_type_label(query_type)
         runtime.running = True
-        runtime.status = "登录中"
-        runtime.message = "正在登录并获取课程列表"
+        runtime.status = "查询中" if query_type != "courses" else "登录中"
+        runtime.message = f"正在登录并执行：{query_label}"
+        runtime.current_course = "" if query_type == "courses" else query_label
         runtime.progress = 0.0
         self.events.put(("account_state", {"account_id": runtime.account_id}))
 
@@ -444,19 +505,36 @@ class ChaoxingGUI(tk.Tk):
             runtime.engine.allow_manual_verify = runtime.allow_manual_verify
             runtime.engine.set_status_callback(self._make_status_callback(runtime.account_id))
 
-        courses = runtime.engine.login_and_get_courses(username=runtime.username, password=runtime.password)
-        runtime.courses = courses
-        runtime.status = "已登录"
-        runtime.message = f"已获取 {len(courses)} 门课程"
+        if query_type == "courses":
+            results = runtime.engine.login_and_get_courses(username=runtime.username, password=runtime.password)
+        else:
+            results = runtime.engine.login_and_query_items(
+                query_type,
+                username=runtime.username,
+                password=runtime.password,
+            )
+        runtime.courses = results
+        runtime.status = "已登录" if query_type == "courses" else "查询完成"
+        unit = "门课程" if query_type == "courses" else "条"
+        runtime.message = f"{query_label}完成，共 {len(results)} {unit}"
         runtime.running = False
-        self.events.put(("courses", {"account_id": runtime.account_id, "courses": courses}))
+        self.events.put(
+            (
+                "courses",
+                {
+                    "account_id": runtime.account_id,
+                    "courses": results,
+                    "query_type": query_type,
+                },
+            )
+        )
         self.events.put(("account_state", {"account_id": runtime.account_id}))
 
     def _worker_run_courses(self, runtime: AccountRuntime, courses: List[Dict[str, str]], task_ids: List[str]) -> None:
         if not courses:
             return
         if runtime.engine is None:
-            self._worker_login(runtime)
+            self._worker_login(runtime, "courses")
         if runtime.engine is None:
             raise RuntimeError("账号浏览器未初始化")
 
@@ -519,7 +597,11 @@ class ChaoxingGUI(tk.Tk):
             if event_name == "status":
                 self._apply_status(str(payload.get("account_id")), dict(payload.get("status") or {}))
             elif event_name == "courses":
-                self._apply_courses(str(payload.get("account_id")), list(payload.get("courses") or []))
+                self._apply_courses(
+                    str(payload.get("account_id")),
+                    list(payload.get("courses") or []),
+                    str(payload.get("query_type") or ""),
+                )
             elif event_name == "task":
                 self._apply_task_update(dict(payload or {}))
             elif event_name == "account_state":
@@ -552,15 +634,19 @@ class ChaoxingGUI(tk.Tk):
         if current_task:
             self._apply_task_update({"task_id": current_task, "status": runtime.status, "progress": runtime.progress, "message": runtime.message})
 
-    def _apply_courses(self, account_id: str, courses: List[Dict[str, str]]) -> None:
+    def _apply_courses(self, account_id: str, courses: List[Dict[str, str]], query_type: str = "") -> None:
         runtime = self.accounts.get(account_id)
         if runtime is None:
             return
+        if query_type:
+            runtime.query_type = self._normalize_task_type(query_type)
         runtime.courses = courses
         self._upsert_account_row(runtime)
         if self.selected_account_id == account_id:
             self._load_courses_for_account(runtime)
-        self._append_log(f"[{runtime.display_name}] 课程列表加载完成，共 {len(courses)} 门")
+        label = self._task_type_label(runtime.query_type)
+        unit = "门" if runtime.query_type == "courses" else "条"
+        self._append_log(f"[{runtime.display_name}] {label}加载完成，共 {len(courses)} {unit}")
 
     def _apply_task_update(self, payload: Dict[str, Any]) -> None:
         task_id = str(payload.get("task_id") or "")
@@ -631,19 +717,18 @@ class ChaoxingGUI(tk.Tk):
                 self.account_tree.focus(account_id)
         self.username_var.set(runtime.username)
         self.password_var.set(runtime.password)
+        self.task_type_var.set(self._task_type_label(runtime.query_type))
         self.visible_browser_var.set(not runtime.headless)
         self.manual_verify_var.set(runtime.allow_manual_verify)
         self._load_courses_for_account(runtime)
 
     def _load_courses_for_account(self, runtime: AccountRuntime) -> None:
+        self._configure_result_table(runtime.query_type)
         for item in self.course_tree.get_children():
             self.course_tree.delete(item)
         for index, course in enumerate(runtime.courses, start=1):
-            self.course_tree.insert(
-                "",
-                tk.END,
-                iid=str(index),
-                values=(
+            if runtime.query_type == "courses":
+                values = (
                     index,
                     course.get("name", ""),
                     self._course_value(course, "course_id"),
@@ -652,8 +737,74 @@ class ChaoxingGUI(tk.Tk):
                     str(course.get("exam_status") or course.get("has_exam") or "未显示"),
                     self._task_display(course),
                     course.get("url", ""),
-                ),
+                )
+            else:
+                values = (
+                    index,
+                    course.get("title") or course.get("name") or "",
+                    course.get("course_name") or "未显示",
+                    course.get("start_time") or "未显示",
+                    course.get("end_time") or "未显示",
+                    course.get("status_text") or course.get("status") or "未显示",
+                    "考试" if runtime.query_type == "pending_exams" else "作业",
+                    course.get("url") or course.get("source_url") or "",
+                )
+            self.course_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=values,
             )
+
+    def _configure_result_table(self, query_type: str) -> None:
+        query_type = self._normalize_task_type(query_type)
+        if query_type == "courses":
+            title = "选中账号的课程列表（支持 Ctrl/Shift 多选）"
+            headings = {
+                "index": "序号",
+                "name": "课程名",
+                "course_id": "courseId",
+                "start_time": "开始时间",
+                "end_time": "截止时间",
+                "exam_status": "考试",
+                "task_progress": "任务进度",
+                "url": "链接",
+            }
+            name_width = 260
+            course_column_width = 130
+            action_state = tk.NORMAL
+        else:
+            type_name = {
+                "pending_exams": "待考试列表",
+                "pending_homeworks": "待做作业列表",
+                "homeworks_by_course": "全部作业（按课程展示）",
+            }[query_type]
+            title = f"选中账号的{type_name}"
+            headings = {
+                "index": "序号",
+                "name": "考试名称" if query_type == "pending_exams" else "作业名称",
+                "course_id": "所属课程",
+                "start_time": "开始/发布时间",
+                "end_time": "截止时间",
+                "exam_status": "状态",
+                "task_progress": "类型",
+                "url": "链接",
+            }
+            name_width = 310
+            course_column_width = 180
+            action_state = tk.DISABLED
+
+        self.course_frame.configure(text=title)
+        for column, text in headings.items():
+            self.course_tree.heading(column, text=text)
+        self.course_tree.column("name", width=name_width, anchor=tk.W)
+        self.course_tree.column(
+            "course_id",
+            width=course_column_width,
+            anchor=tk.W if query_type != "courses" else tk.CENTER,
+        )
+        self.enqueue_courses_button.configure(state=action_state)
+        self.select_all_courses_button.configure(state=action_state)
 
     def _selected_runtime(self) -> Optional[AccountRuntime]:
         account_id = self.selected_account_id
@@ -675,6 +826,18 @@ class ChaoxingGUI(tk.Tk):
             if len(values) >= 3 and values[0] == runtime.display_name and values[2] in {"运行中", "running", "学习中"}:
                 return str(task_id)
         return ""
+
+    def _selected_task_type(self) -> str:
+        return self._normalize_task_type(TASK_TYPE_LABEL_TO_VALUE.get(self.task_type_var.get(), "courses"))
+
+    @staticmethod
+    def _normalize_task_type(query_type: str) -> str:
+        normalized = str(query_type or "").strip().lower()
+        return normalized if normalized in TASK_TYPE_VALUE_TO_LABEL else "courses"
+
+    @staticmethod
+    def _task_type_label(query_type: str) -> str:
+        return TASK_TYPE_VALUE_TO_LABEL.get(query_type, TASK_TYPE_VALUE_TO_LABEL["courses"])
 
     @staticmethod
     def _course_value(course: Dict[str, str], key: str) -> str:
